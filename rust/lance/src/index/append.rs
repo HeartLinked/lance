@@ -27,7 +27,6 @@ use lance_index::{
     },
 };
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
-use lance_io::utils::CachedFileSize;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use lance_table::format::overlay::staleness::field_affects_index;
 use lance_table::format::{Fragment, IndexMetadata};
@@ -570,7 +569,9 @@ impl<'a> SeedHarvester<'a> {
             .data_file_dir(data_file)?
             .join(data_file.path.as_str());
         let scheduler = self.scheduler(data_file.base_id).await?;
-        let Ok(file_scheduler) = scheduler.open_file(&path, &CachedFileSize::unknown()).await
+        // The manifest's size for the serving file, when it has one; the
+        // scheduler probes and caches it otherwise.
+        let Ok(file_scheduler) = scheduler.open_file(&path, &data_file.file_size_bytes).await
         else {
             return Ok(None);
         };

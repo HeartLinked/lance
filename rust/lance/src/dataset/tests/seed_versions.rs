@@ -426,6 +426,108 @@ async fn test_index_update_scans_invalid_version_0_seed() {
     }
 }
 
+/// Harvesting a seed opens the serving data file with the size the manifest
+/// records, so an index build over files with known sizes issues no size
+/// probe (`head`) on them, only the footer/seed reads; a fragment whose
+/// manifest entry lacks the size (older manifests) is still harvested
+/// through the scheduler's probe, exactly once.
+#[tokio::test]
+async fn test_seed_harvest_uses_the_manifest_file_size() {
+    use lance_io::utils::CachedFileSize;
+
+    use crate::index::append::SeedHarvester;
+    use crate::index::scalar::zonemap::SEED_REUSE_REPORTS;
+
+    let dir = TempStrDir::default();
+    let mut dataset = seeded_dataset(dir.as_str(), &["val"]).await;
+    append(&mut dataset, TRAINING_ROWS).await;
+    let crafted = rows(TRAINING_ROWS + ROWS_PER_FILE, ROWS_PER_FILE);
+    let seeds = vec![("val", seed_bytes("val", crafted.column(0)))];
+    let mut dataset = commit_crafted_fragment(dataset, crafted, &seeds).await;
+    let fragments: Vec<Fragment> = dataset.fragments().iter().skip(1).cloned().collect();
+    assert_eq!(fragments.len(), 2);
+    for fragment in &fragments {
+        assert!(
+            fragment.files[0].file_size_bytes.get().is_some(),
+            "committed files carry their size in the manifest: {fragment:?}"
+        );
+    }
+    let requests_on =
+        |io: &lance_io::utils::tracking_store::IoStats, fragment: &Fragment, method: &str| {
+            let path = fragment.files[0].path.clone();
+            io.requests
+                .iter()
+                .filter(|r| r.method == method && r.path.to_string().ends_with(&path))
+                .count()
+        };
+
+    // The build: both seeds reused, no size probe on either data file.
+    dataset.object_store.io_stats_incremental();
+    let reports = SEED_REUSE_REPORTS
+        .scope(std::sync::Mutex::new(Vec::new()), async {
+            dataset
+                .optimize_indices(&OptimizeOptions::default())
+                .await
+                .unwrap();
+            SEED_REUSE_REPORTS.with(|reports| reports.lock().unwrap().clone())
+        })
+        .await;
+    let io = dataset.object_store.io_stats_incremental();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(
+        reports[0].reused_fragments,
+        fragments.iter().map(|f| f.id).collect::<Vec<_>>()
+    );
+    assert_eq!(reports[0].scanned_rows, 0);
+    for fragment in &fragments {
+        assert_eq!(
+            requests_on(&io, fragment, "head"),
+            0,
+            "a known size needs no probe: {:?}",
+            io.requests
+        );
+        assert!(
+            requests_on(&io, fragment, "get_range") >= 1,
+            "the seed is read from the file: {:?}",
+            io.requests
+        );
+    }
+
+    // A manifest entry without a size: the scheduler probes it once and the
+    // seed is harvested all the same.
+    let mut without_size = fragments[1].clone();
+    without_size.files[0].file_size_bytes = CachedFileSize::unknown();
+    let harvester = SeedHarvester::for_column(&dataset, "val").unwrap();
+    dataset.object_store.io_stats_incremental();
+    let seed = harvester
+        .harvest(&without_size)
+        .await
+        .unwrap()
+        .expect("the seed is harvested through the size probe");
+    let io = dataset.object_store.io_stats_incremental();
+    assert_eq!(seed.physical_rows, ROWS_PER_FILE as u64);
+    assert_eq!(
+        requests_on(&io, &without_size, "head"),
+        1,
+        "an unknown size is probed once: {:?}",
+        io.requests
+    );
+    assert!(requests_on(&io, &without_size, "get_range") >= 1);
+    dataset.object_store.io_stats_incremental();
+    assert!(harvester.harvest(&fragments[1]).await.unwrap().is_some());
+    let io = dataset.object_store.io_stats_incremental();
+    assert_eq!(requests_on(&io, &fragments[1], "head"), 0);
+
+    let reopened = Dataset::open(dir.as_str()).await.unwrap();
+    for filter in ["val > 20", "val = 70", "val < 100 AND val > 30"] {
+        assert_eq!(
+            count(&reopened, filter, true).await,
+            count(&reopened, filter, false).await,
+            "{filter}"
+        );
+    }
+}
+
 /// One version 1 segment built from fragments whose seeds have different
 /// versions and contents. Every record of the output meets the version 1
 /// contract (ordinary extrema, exact NaN sign split), and a legacy record

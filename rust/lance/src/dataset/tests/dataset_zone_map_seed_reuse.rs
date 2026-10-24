@@ -1621,18 +1621,27 @@ impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
 #[allow(clippy::print_stderr)]
 async fn test_harvest_reads_are_bounded_and_concurrent() {
     let watch = Arc::new(ReadWatch::default());
-    let params = WriteParams {
-        max_rows_per_file: ROWS_PER_FILE,
-        store_params: Some(lance_io::object_store::ObjectStoreParams {
-            object_store_wrapper: Some(Arc::new(SlowReadsWrapper(watch.clone()))),
-            ..Default::default()
-        }),
+    let store_params = lance_io::object_store::ObjectStoreParams {
+        object_store_wrapper: Some(Arc::new(SlowReadsWrapper(watch.clone()))),
         ..Default::default()
     };
-    let dir = TempStrDir::default();
+    // An in-memory store, so data-file reads go through the `object_store`
+    // layer the wrapper counts (local files are read directly), and a
+    // session without a metadata cache, so every harvest reads its footer.
+    let session = Arc::new(crate::session::Session::new(
+        0,
+        0,
+        Arc::new(lance_io::object_store::ObjectStoreRegistry::default()),
+    ));
+    let params = WriteParams {
+        max_rows_per_file: ROWS_PER_FILE,
+        store_params: Some(store_params),
+        session: Some(session),
+        ..Default::default()
+    };
     let mut dataset = Dataset::write(
         RecordBatchIterator::new([Ok(rows(0..1000))], schema()),
-        dir.as_str(),
+        "memory://zonemap-harvest-bound",
         Some(params),
     )
     .await
