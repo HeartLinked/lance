@@ -278,6 +278,8 @@ pub struct FullSchemaMergeInsertExec {
     inserted_rows_filter: Arc<Mutex<Option<KeyExistenceFilter>>>,
     source_skipped_duplicates: Arc<AtomicU64>,
     source_blob_columns: Vec<String>,
+    /// The caller's write parameters for the data files this node writes.
+    write_params: Arc<WriteParams>,
     update_if_deferred: bool,
 }
 
@@ -288,6 +290,7 @@ impl FullSchemaMergeInsertExec {
         params: MergeInsertParams,
         source_skipped_duplicates: Arc<AtomicU64>,
         source_blob_columns: Vec<String>,
+        write_params: Arc<WriteParams>,
     ) -> DFResult<Self> {
         let empty_schema = Arc::new(arrow_schema::Schema::empty());
         let properties = Arc::new(PlanProperties::new(
@@ -309,6 +312,7 @@ impl FullSchemaMergeInsertExec {
             inserted_rows_filter: Arc::new(Mutex::new(None)),
             source_skipped_duplicates,
             source_blob_columns,
+            write_params,
             update_if_deferred: false,
         })
     }
@@ -1137,6 +1141,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             inserted_rows_filter: self.inserted_rows_filter.clone(),
             source_skipped_duplicates: self.source_skipped_duplicates.clone(),
             source_blob_columns: self.source_blob_columns.clone(),
+            write_params: self.write_params.clone(),
             update_if_deferred: self.update_if_deferred,
         }))
     }
@@ -1254,6 +1259,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
         let compacted_sstables = self.params.compacted_sstables.clone();
         let source_skipped_duplicates = self.source_skipped_duplicates.clone();
         let source_blob_columns = self.source_blob_columns.clone();
+        let caller_write_params = self.write_params.clone();
         let updating_row_ids = {
             let state = merge_state.lock().unwrap();
             state.updating_row_ids.clone()
@@ -1264,9 +1270,21 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
             let target_bases_info = resolve_target_bases(&dataset, &params).await?;
             // Keep a copy so failures after the write can clean up routed files.
             let cleanup_bases = target_bases_info.clone();
+            // Existing target references may be outside the current bases, so
+            // the writer admits them; source-provided blob columns are checked
+            // unless the caller allows references outside the bases.
+            let allow_source_outside_bases = caller_write_params.allow_external_blob_outside_bases;
             let write_params = WriteParams {
-                allow_external_blob_outside_bases: has_blob_v2_columns,
-                ..Default::default()
+                allow_external_blob_outside_bases: allow_source_outside_bases
+                    || has_blob_v2_columns,
+                ..caller_write_params.as_ref().clone()
+            };
+            // `write_groups` checks the source-provided blob columns; with the
+            // caller's allowance none is checked.
+            let checked_source_blob_columns: &[String] = if allow_source_outside_bases {
+                &[]
+            } else {
+                &source_blob_columns
             };
             let (mut new_fragments, update_fragment_count) = Self::write_groups(
                 &dataset,
@@ -1274,7 +1292,7 @@ impl ExecutionPlan for FullSchemaMergeInsertExec {
                 write_data_streams,
                 splitter,
                 &write_params,
-                &source_blob_columns,
+                checked_source_blob_columns,
                 target_bases_info,
             )
             .await?;
@@ -1457,6 +1475,7 @@ mod tests {
             job.params,
             Arc::new(AtomicU64::new(0)),
             Vec::new(),
+            Arc::new(WriteParams::default()),
         )
         .unwrap();
         let state = Arc::new(Mutex::new(MergeState::new(
@@ -1763,6 +1782,7 @@ mod tests {
             job.params.clone(),
             Arc::new(std::sync::atomic::AtomicU64::new(0)),
             Vec::new(),
+            Arc::new(WriteParams::default()),
         )
         .unwrap();
 
