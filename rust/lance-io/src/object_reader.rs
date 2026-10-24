@@ -703,6 +703,89 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(all(feature = "aws", feature = "test-util"))]
+    #[tokio::test]
+    #[ignore = "read-only S3 admission diagnostic with explicit retained object URIs"]
+    async fn s3_expected_size_admission_readonly() {
+        let input = std::env::var("SEVENRESEARCH_READER_OBJECT_URIS").unwrap();
+        let uris: Vec<_> = input.lines().collect();
+        assert_eq!(uris.len(), 3);
+        assert_eq!(
+            uris.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3
+        );
+        for (index, uri) in uris.into_iter().enumerate() {
+            assert!(uri.starts_with("s3://lance-bench-054483968661-us-east-2/sevenresearch-training-20261014/function-small-task-validated-get-20261024/"));
+            assert!(uri.contains("/data/") && uri.ends_with(".lance"));
+            let (original, path) = crate::object_store::ObjectStore::from_uri(uri)
+                .await
+                .unwrap();
+            assert_eq!(original.block_size(), 65536);
+            let before = original.inner.head(&path).await.unwrap();
+            assert!(before.size > 0 && before.size <= original.block_size() as u64);
+            let stats = Arc::new(Mutex::new(IoStats::default()));
+            let mut store = (*original).clone();
+            store.inner = Arc::new(IoTrackingStore::new(original.inner.clone(), stats.clone()));
+            let mut reference: Option<Bytes> = None;
+            println!(
+                "S3_ADMISSION_OBJECT index={index} uri={uri} size={} etag={:?} version={:?}",
+                before.size, before.e_tag, before.version
+            );
+            for (label, checked) in [("A1", false), ("B1", true), ("B2", true), ("A2", false)] {
+                *stats.lock().unwrap() = IoStats::default();
+                let start = std::time::Instant::now();
+                let mut head_us = 0;
+                let reader = if checked {
+                    store
+                        .open_with_expected_size(&path, before.size)
+                        .await
+                        .unwrap()
+                } else {
+                    let actual = store.size(&path).await.unwrap();
+                    head_us = start.elapsed().as_micros();
+                    assert_eq!(actual, before.size);
+                    store.open_with_size(&path, actual as usize).await.unwrap()
+                };
+                let admitted_us = start.elapsed().as_micros();
+                let body_start = std::time::Instant::now();
+                let bytes = reader.get_all().await.unwrap();
+                let body_us = body_start.elapsed().as_micros();
+                let total_us = start.elapsed().as_micros();
+                assert_eq!(bytes.len() as u64, before.size);
+                if let Some(reference) = &reference {
+                    assert_eq!(&bytes, reference);
+                } else {
+                    reference = Some(bytes);
+                }
+                let observed = stats.lock().unwrap().clone();
+                let methods: Vec<_> = observed.requests.iter().map(|r| r.method).collect();
+                assert_eq!(
+                    methods,
+                    if checked {
+                        vec!["get_opts"]
+                    } else {
+                        vec!["head", "get_opts"]
+                    }
+                );
+                assert!(
+                    observed
+                        .requests
+                        .iter()
+                        .all(|r| r.path == path && r.range.is_none())
+                );
+                assert_eq!(observed.write_iops, 0);
+                assert_eq!(observed.read_bytes, before.size);
+                println!(
+                    "S3_ADMISSION_SAMPLE index={index} label={label} head_us={head_us} admitted_us={admitted_us} body_us={body_us} total_us={total_us} read_iops={} range_bytes={} writes={} methods={methods:?}",
+                    observed.read_iops, observed.read_bytes, observed.write_iops
+                );
+            }
+            let after = original.inner.head(&path).await.unwrap();
+            assert_eq!(before, after);
+            println!("S3_ADMISSION_IDENTITY index={index} unchanged=true bodies_equal=true");
+        }
+    }
+
     #[tokio::test]
     #[ignore = "bounded body collection diagnostic, not a storage benchmark"]
     async fn small_reader_body_collection_cost() {
