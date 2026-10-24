@@ -681,6 +681,68 @@ mod tests {
         .unwrap()
     }
 
+    #[tokio::test]
+    #[ignore = "bounded body collection diagnostic, not a storage benchmark"]
+    async fn small_reader_body_collection_cost() {
+        const ITERATIONS: usize = 512;
+        // The observed finalization fixture and the existing S3 block boundary.
+        for size in [1315, 64 * 1024] {
+            for chunks in [1, 8] {
+                let payload = Bytes::from(vec![7; size]);
+                let body: Vec<_> = (0..chunks)
+                    .map(|index| payload.slice(index * size / chunks..(index + 1) * size / chunks))
+                    .collect();
+                let store = Arc::new(PartialBodyStore {
+                    metadata_size: size as u64,
+                    body,
+                    failed_downloads: 0,
+                    ..Default::default()
+                });
+                let request = Arc::new(GetRequest {
+                    object_store: store.clone(),
+                    path: Path::from("test/data.lance"),
+                    options: GetOptions::default(),
+                });
+                let mut elapsed = [std::time::Duration::ZERO; 2];
+                let mut reused = [0; 2];
+                for iteration in 0..ITERATIONS {
+                    // Alternate execution order; both paths see identical chunks.
+                    for offset in 0..2 {
+                        let mode = (iteration + offset) % 2;
+                        let start = std::time::Instant::now();
+                        let bytes = do_get_with_outer_retry::<Error>(
+                            0,
+                            request.clone(),
+                            (mode == 1).then_some(size),
+                            || "body collection diagnostic".to_string(),
+                        )
+                        .await
+                        .unwrap();
+                        elapsed[mode] += start.elapsed();
+                        reused[mode] += usize::from(bytes.as_ptr() == payload.as_ptr());
+                        assert_eq!(bytes, payload);
+                        std::hint::black_box(bytes);
+                    }
+                }
+                assert_eq!(store.requests.load(Ordering::SeqCst), ITERATIONS * 2);
+                assert_eq!(store.head_requests.load(Ordering::SeqCst), 0);
+                assert_eq!(
+                    store.body_polls.load(Ordering::SeqCst),
+                    ITERATIONS * 2 * chunks
+                );
+                println!(
+                    "body_collection size={size} chunks={chunks} iterations={ITERATIONS} original_us={} bounded_us={} original_reused={} bounded_reused={} requests={} body_polls={}",
+                    elapsed[0].as_micros(),
+                    elapsed[1].as_micros(),
+                    reused[0],
+                    reused[1],
+                    store.requests.load(Ordering::SeqCst),
+                    store.body_polls.load(Ordering::SeqCst)
+                );
+            }
+        }
+    }
+
     /// A body that stops partway is what `download_retry_count` documents, and
     /// `get_range` has to honor it like `get_all` already did.
     #[rstest]
