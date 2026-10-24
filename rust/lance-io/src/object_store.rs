@@ -1022,13 +1022,13 @@ impl ObjectStore {
         expected_size: u64,
     ) -> Result<Box<dyn Reader>> {
         if expected_size <= self.block_size as u64 {
-            let reader = SmallReader::new(
+            let reader = SmallReader::open_with_expected_size(
                 self.inner.clone(),
                 path.clone(),
                 self.download_retry_count,
                 expected_size as usize,
-            );
-            reader.validate_size().await?;
+            )
+            .await?;
             return Ok(Box::new(reader));
         }
         let actual_size = self.size(path).await?;

@@ -366,10 +366,6 @@ impl std::fmt::Debug for SmallReaderState {
 }
 
 impl SmallReader {
-    pub(crate) async fn validate_size(&self) -> Result<()> {
-        self.inner.wait().await.map(|_| ())
-    }
-
     pub fn new(
         store: Arc<dyn ObjectStore>,
         path: Path,
@@ -377,21 +373,47 @@ impl SmallReader {
         size: usize,
     ) -> Self {
         let path_ref = path.clone();
+        Self::from_download(path, size, async move {
+            let reader = CloudObjectReader::new(store, path_ref, 0, None, download_retry_count)?;
+            reader.get_all().await.map_err(Error::from)
+        })
+    }
+
+    /// Admit a checkpoint length before exposing the reader to its caller.
+    /// Ordinary known-size readers do not require this stricter contract.
+    pub(crate) async fn open_with_expected_size(
+        store: Arc<dyn ObjectStore>,
+        path: Path,
+        download_retry_count: usize,
+        expected_size: usize,
+    ) -> Result<Self> {
+        let request = Arc::new(GetRequest {
+            object_store: store,
+            path: path.clone(),
+            options: GetOptions::default(),
+        });
+        let reader = Self::from_download(path, expected_size, async move {
+            do_get_with_outer_retry::<Error>(
+                download_retry_count,
+                request,
+                Some(expected_size),
+                || "read_all".to_string(),
+            )
+            .await
+        });
+        reader.inner.wait().await?;
+        Ok(reader)
+    }
+
+    fn from_download(
+        path: Path,
+        size: usize,
+        download: impl std::future::Future<Output = Result<Bytes>> + Send + 'static,
+    ) -> Self {
         let state = SmallReaderState::Loading(
-            async move {
-                let request = Arc::new(GetRequest {
-                    object_store: store,
-                    path: path_ref,
-                    options: GetOptions::default(),
-                });
-                do_get_with_outer_retry::<Error>(download_retry_count, request, Some(size), || {
-                    "read_all".to_string()
-                })
-                .await
-                .map_err(CloneableError::new)
-            }
-            .boxed()
-            .shared(),
+            async move { download.await.map_err(CloneableError::new) }
+                .boxed()
+                .shared(),
         );
         Self {
             inner: Arc::new(SmallReaderInner {
@@ -788,6 +810,40 @@ mod tests {
         assert_eq!(requests.load(Ordering::Relaxed), 4);
     }
     #[rstest]
+    #[case::same_size(1024, None)]
+    #[case::stale_hint(1023, None)]
+    #[case::partial_metadata_range(1024, Some(0..512))]
+    #[tokio::test]
+    async fn known_size_open_preserves_body_collection_and_shared_bytes(
+        #[case] known_size: usize,
+        #[case] returned_range: Option<Range<u64>>,
+    ) {
+        let body = Bytes::from(vec![7; 1024]);
+        let inner = Arc::new(PartialBodyStore {
+            body: vec![body.clone()],
+            returned_range,
+            failed_downloads: 0,
+            ..Default::default()
+        });
+        let mut store = crate::object_store::ObjectStore::memory();
+        store.inner = inner.clone();
+        let reader = store
+            .open_with_size(&Path::from("part"), known_size)
+            .await
+            .unwrap();
+        assert_eq!(inner.requests.load(Ordering::SeqCst), 0);
+        let (first, second) = tokio::join!(reader.get_all(), reader.get_range(8..16));
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first, body);
+        assert_eq!(first.as_ptr(), body.as_ptr());
+        assert_eq!(second.as_ptr(), body.slice(8..16).as_ptr());
+        assert_eq!(inner.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.head_requests.load(Ordering::SeqCst), 0);
+        assert_eq!(inner.body_polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[rstest]
     #[case::short(1023, None)]
     #[case::long(1025, None)]
     #[case::partial_range(1024, Some(0..512))]
@@ -802,8 +858,10 @@ mod tests {
             failed_downloads: 0,
             ..Default::default()
         });
-        let reader = SmallReader::new(store.clone(), Path::from("part"), 3, 1024);
-        let error = reader.validate_size().await.unwrap_err();
+        let error =
+            SmallReader::open_with_expected_size(store.clone(), Path::from("part"), 3, 1024)
+                .await
+                .unwrap_err();
         assert!(
             matches!(error.find_root(), Error::InvalidInput { .. }),
             "{error}"
@@ -829,8 +887,10 @@ mod tests {
             failed_downloads: 0,
             ..Default::default()
         });
-        let reader = SmallReader::new(store.clone(), Path::from("part"), 1, 1024);
-        let error = reader.validate_size().await.unwrap_err();
+        let error =
+            SmallReader::open_with_expected_size(store.clone(), Path::from("part"), 1, 1024)
+                .await
+                .unwrap_err();
         assert!(matches!(error.find_root(), Error::IO { .. }), "{error}");
         assert!(error.to_string().contains(message), "{error}");
         assert_eq!(store.requests.load(Ordering::SeqCst), 2);
@@ -842,11 +902,13 @@ mod tests {
             failed_downloads: 1,
             ..Default::default()
         });
-        let reader = SmallReader::new(store.clone(), Path::from("part"), 1, 1024);
+        let reader =
+            SmallReader::open_with_expected_size(store.clone(), Path::from("part"), 1, 1024)
+                .await
+                .unwrap();
         let (first, second) = tokio::join!(reader.get_all(), reader.get_range(8..16));
         assert_eq!(first.unwrap(), Bytes::from(vec![7; 1024]));
         assert_eq!(second.unwrap(), Bytes::from(vec![7; 8]));
-        reader.validate_size().await.unwrap();
         assert_eq!(store.requests.load(Ordering::SeqCst), 2);
     }
 
@@ -861,12 +923,12 @@ mod tests {
             .put(&path, Bytes::from_static(b"old!").into())
             .await
             .unwrap();
-        let reader = SmallReader::new(store.clone(), path.clone(), 3, 4);
+        let opening = SmallReader::open_with_expected_size(store.clone(), path.clone(), 3, 4);
         store
             .put(&path, Bytes::from(vec![0; size]).into())
             .await
             .unwrap();
-        let error = reader.validate_size().await.unwrap_err();
+        let error = opening.await.unwrap_err();
         assert!(
             matches!(error.find_root(), Error::InvalidInput { .. }),
             "{error}"
@@ -911,10 +973,15 @@ mod tests {
             body_gate: Some(gate.clone()),
             ..Default::default()
         });
-        let reader = SmallReader::new(store.clone(), Path::from("part"), 3, 1024);
-        assert!(reader.get_all().now_or_never().is_none());
+        let mut opening = Box::pin(SmallReader::open_with_expected_size(
+            store.clone(),
+            Path::from("part"),
+            3,
+            1024,
+        ));
+        assert!(opening.as_mut().now_or_never().is_none());
         assert_eq!(store.requests.load(Ordering::SeqCst), 1);
-        drop(reader);
+        drop(opening);
         assert_eq!(Arc::strong_count(&gate), 2); // Test and store only; no pending stream.
         assert_eq!(store.body_polls.load(Ordering::SeqCst), 0);
     }
