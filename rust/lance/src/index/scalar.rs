@@ -41,6 +41,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::TryStreamExt;
 use itertools::Itertools;
 use lance_core::datatypes::Field;
+use lance_core::utils::tokio::get_num_compute_intensive_cpus;
 use lance_core::utils::tracing::{IO_TYPE_OPEN_SCALAR, TRACE_IO_EVENTS};
 use lance_core::{Error, ROW_ADDR, ROW_ID, Result};
 use lance_datafusion::exec::LanceExecutionOptions;
@@ -52,6 +53,7 @@ use lance_index::pbold::{
 use lance_index::progress::IndexBuildProgress;
 use lance_index::registry::IndexPluginRegistry;
 use lance_index::scalar::IndexStore;
+use lance_index::scalar::inverted::builder::resolve_num_workers;
 use lance_index::scalar::inverted::{InvertedIndex, METADATA_FILE};
 use lance_index::scalar::label_list::{
     LABEL_LIST_NULLS_METADATA_KEY, LABEL_LIST_NULLS_MIN_VERSION,
@@ -162,10 +164,14 @@ pub(crate) async fn scan_training_data(
     column: &str,
     criteria: &TrainingCriteria,
     selection: Option<TrainingRows>,
+    batch_readahead: Option<usize>,
 ) -> Result<SendableRecordBatchStream> {
     let num_rows = dataset.count_all_rows().await?;
 
     let mut scan = dataset.scan();
+    if let Some(batch_readahead) = batch_readahead {
+        scan.batch_readahead(batch_readahead);
+    }
     #[cfg(test)]
     if let Ok(io_buffer_size) = TEST_TRAINING_IO_BUFFER_SIZE.try_with(|size| *size) {
         scan.io_buffer_size(io_buffer_size);
@@ -239,6 +245,7 @@ pub(crate) async fn load_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    batch_readahead: Option<usize>,
 ) -> Result<SendableRecordBatchStream> {
     // Create training request with fragment_ids if provided
     let training_request = Box::new(match fragment_ids.clone() {
@@ -273,10 +280,10 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(dataset, column, criteria, selection).await
+            scan_training_data(dataset, column, criteria, selection, batch_readahead).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(dataset, column, criteria, selection).await
+            scan_training_data(dataset, column, criteria, selection, batch_readahead).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
@@ -290,6 +297,7 @@ pub(crate) async fn load_fts_training_data(
     fragments: Option<Vec<Fragment>>,
     train: bool,
     fragment_ids: Option<Vec<u32>>,
+    params: &InvertedIndexParams,
 ) -> Result<SendableRecordBatchStream> {
     // Row-count batching alone can retain large decoded text buffers in the
     // scanner and indexing workers. Keep explicit reader settings, and apply
@@ -312,6 +320,13 @@ pub(crate) async fn load_fts_training_data(
         fragments,
         train,
         fragment_ids,
+        // Allow decoding to overlap consumption without scaling speculative
+        // input buffers to every CPU in a build with only a few workers.
+        Some(
+            resolve_num_workers(params)
+                .saturating_mul(2)
+                .min(get_num_compute_intensive_cpus().max(1)),
+        ),
     )
     .await?;
     if resolved.has_lists() {
@@ -490,6 +505,9 @@ pub(super) async fn build_scalar_index(
             preprocessed_data
         }
         (None, Some(resolved)) => {
+            let fts_params = inverted_params.as_ref().ok_or_else(|| {
+                Error::internal("resolved FTS field is missing its training parameters")
+            })?;
             load_fts_training_data(
                 dataset,
                 resolved,
@@ -497,6 +515,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                fts_params,
             )
             .await?
         }
@@ -508,6 +527,7 @@ pub(super) async fn build_scalar_index(
                 None,
                 train,
                 fragment_ids.clone(),
+                None,
             )
             .await?
         }
@@ -593,8 +613,16 @@ pub(super) async fn build_bitmap_index_segment(
     let criteria = training_request.criteria();
 
     progress.stage_start("load_data", None, "rows").await?;
-    let training_data =
-        load_training_data(dataset, column, criteria, None, true, Some(fragment_ids)).await?;
+    let training_data = load_training_data(
+        dataset,
+        column,
+        criteria,
+        None,
+        true,
+        Some(fragment_ids),
+        None,
+    )
+    .await?;
     progress.stage_complete("load_data").await?;
 
     let index_store = LanceIndexStore::from_dataset_for_new(dataset, &uuid)?;
@@ -1664,6 +1692,7 @@ mod tests {
             None,
             true,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -1691,7 +1720,10 @@ mod tests {
     #[case::default_limit(None)]
     #[case::explicit_limit(Some(64 * 1024 * 1024))]
     #[tokio::test]
-    async fn test_fts_training_scan_byte_target(#[case] byte_target: Option<u64>) {
+    async fn test_fts_training_scan_byte_target(
+        #[case] byte_target: Option<u64>,
+        #[values(1, 3)] workers: usize,
+    ) {
         async fn largest_original_batch(dataset: &Dataset) -> usize {
             let mut scan = dataset.scan();
             scan.project(&["content"]).unwrap();
@@ -1721,10 +1753,11 @@ mod tests {
             });
         }
         assert!(largest_original_batch(&dataset).await >= 40);
+        let params = InvertedIndexParams::default().num_workers(workers);
         let resolved = inverted::resolve_fts_field(
             dataset.schema(),
             "content",
-            InvertedIndexParams::default().get_document_granularity(),
+            params.get_document_granularity(),
         )
         .unwrap();
         let mut stream = load_fts_training_data(
@@ -1734,6 +1767,7 @@ mod tests {
             None,
             true,
             None,
+            &params,
         )
         .await
         .unwrap();
