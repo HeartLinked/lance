@@ -3,6 +3,7 @@
 
 use std::{collections::HashSet, num::NonZeroU64, ops::Range};
 
+use futures::{StreamExt, TryStreamExt, stream};
 use lance_core::{Error, Result};
 use lance_file::concat::{DataFilePart as OpenedDataFilePart, EncodedFileInput};
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
@@ -101,22 +102,28 @@ impl DataFilePart {
         let store = dataset.object_store(target.base_id).await?;
         let dir = target.parts_dir(&dataset.data_file_dir_for_base(target.base_id)?);
         let scheduler = ScanScheduler::new(store.clone(), SchedulerConfig::max_bandwidth(&store));
-        let mut opened = Vec::with_capacity(parts.len());
-        for part in parts {
-            let path = dir.clone().join(part.file_name.as_str());
-            let reader = store
-                .open_with_expected_size(&path, part.size_bytes())
-                .await?;
-            let file = scheduler.open_reader(reader.into());
-            opened.push(
-                OpenedDataFilePart::open(
-                    EncodedFileInput::new(file).with_expected_num_rows(part.num_rows()),
-                    part.blob_ids.clone(),
-                    target.blob_target_id(),
-                )
-                .await?,
-            );
-        }
-        Ok(opened)
+        stream::iter(parts)
+            .map(|part| {
+                let path = dir.clone().join(part.file_name.as_str());
+                let store = &store;
+                let scheduler = &scheduler;
+                async move {
+                    let reader = store
+                        .open_with_expected_size(&path, part.size_bytes())
+                        .await?;
+                    let file = scheduler.open_reader(reader.into());
+                    OpenedDataFilePart::open(
+                        EncodedFileInput::new(file).with_expected_num_rows(part.num_rows()),
+                        part.blob_ids.clone(),
+                        target.blob_target_id(),
+                    )
+                    .await
+                }
+            })
+            // Assembly must retain the caller's physical row order even when
+            // later parts finish admission first.
+            .buffered(store.io_parallelism())
+            .try_collect()
+            .await
     }
 }
