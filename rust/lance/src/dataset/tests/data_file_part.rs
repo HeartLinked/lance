@@ -4,11 +4,13 @@
 use std::{
     collections::HashMap,
     fs,
+    future::Future,
     ops::Range,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    task::Poll,
 };
 
 use arrow::array::AsArray;
@@ -1030,7 +1032,8 @@ impl object_store::ObjectStore for GatedPartStore {
             self.gates.started.fetch_add(1, Ordering::SeqCst);
             self.gates.active.fetch_add(1, Ordering::SeqCst);
             let _active = ActivePartRead(&self.gates.active);
-            gate.acquire().await.unwrap().forget();
+            // An opened gate also admits the reader's existing request retries.
+            let _permit = gate.acquire().await.unwrap();
             if self.gates.fail {
                 return Err(object_store::Error::NotFound {
                     path: path.to_string(),
@@ -1146,13 +1149,14 @@ async fn part_admission_overlaps_within_store_budget(#[case] outcome: &str) {
     if outcome == "cancel" {
         drop(concat);
     } else if outcome == "error" {
-        gates.gates[&dir.clone().join(parts[0].file_name.as_str())].add_permits(1);
+        let failed_path = dir.clone().join(parts[0].file_name.as_str());
+        gates.gates[&failed_path].add_permits(1);
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), concat)
             .await
             .unwrap()
             .unwrap_err();
         assert!(
-            error.to_string().contains("part removed at admission"),
+            matches!(error.find_root(), Error::NotFound { uri, .. } if uri == &failed_path.to_string()),
             "{error}"
         );
     } else {
@@ -1161,7 +1165,21 @@ async fn part_admission_overlaps_within_store_budget(#[case] outcome: &str) {
         for part in &parts[1..window] {
             gates.gates[&dir.clone().join(part.file_name.as_str())].add_permits(1);
         }
-        assert!(futures::poll!(concat.as_mut()).is_pending());
+        // Buffered may yield cooperatively before polling every ready input.
+        // Drive the real future until all released GETs have returned.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            futures::future::poll_fn(|cx| {
+                assert!(concat.as_mut().poll(cx).is_pending());
+                if gates.active.load(Ordering::SeqCst) == 1 {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(gates.started.load(Ordering::SeqCst), window);
         assert_eq!(gates.active.load(Ordering::SeqCst), 1);
         for gate in gates.gates.values() {
