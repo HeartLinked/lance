@@ -123,6 +123,9 @@ impl DataFilePart {
             // Assembly must retain the caller's physical row order even when
             // later parts finish admission first.
             .buffered(store.io_parallelism())
+            // Resolve the borrowing stream's Send bound here so trait-based
+            // task executors can await admission through a Send future.
+            .boxed()
             .try_collect()
             .await
     }
