@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, fs, ops::Range, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs,
+    ops::Range,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use arrow::array::AsArray;
 use arrow_array::{
@@ -19,11 +27,14 @@ use lance_core::{
 };
 use lance_file::concat::EncodedFileInput;
 use lance_file::version::{ConcreteFileVersion, LanceFileVersion};
+use lance_io::object_store::WrappingObjectStore;
 use lance_io::scheduler::{ScanScheduler, SchedulerConfig};
 use lance_table::feature_flags::MANAGED_BLOBS_META_KEY;
 use lance_table::format::BasePath;
 use object_store::ObjectStoreExt;
+use object_store::path::Path;
 use rstest::rstest;
+use tokio::sync::Semaphore;
 
 use crate::blob::{BlobArrayBuilder, BlobDescriptorArrayBuilder, blob_field};
 use crate::dataset::fragment::FileFragment;
@@ -951,4 +962,224 @@ async fn managed_part_rejects_changed_physical_size_before_output(#[case] grow: 
         .concat_data_file_parts(&target, &[part])
         .await
         .unwrap();
+}
+
+#[derive(Debug)]
+struct PartReadGates {
+    gates: HashMap<Path, Semaphore>,
+    started: AtomicUsize,
+    active: AtomicUsize,
+    fail: bool,
+}
+
+#[derive(Debug)]
+struct GatedPartStore {
+    inner: Arc<dyn object_store::ObjectStore>,
+    gates: Arc<PartReadGates>,
+}
+
+impl std::fmt::Display for GatedPartStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "GatedPartStore({})", self.inner)
+    }
+}
+
+#[derive(Debug)]
+struct PartGateWrapper(Arc<PartReadGates>);
+
+impl WrappingObjectStore for PartGateWrapper {
+    fn wrap(
+        &self,
+        _: &str,
+        inner: Arc<dyn object_store::ObjectStore>,
+    ) -> Arc<dyn object_store::ObjectStore> {
+        Arc::new(GatedPartStore {
+            inner,
+            gates: self.0.clone(),
+        })
+    }
+}
+
+struct ActivePartRead<'a>(&'a AtomicUsize);
+
+impl Drop for ActivePartRead<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for GatedPartStore {
+    async fn get_opts(
+        &self,
+        path: &Path,
+        opts: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !opts.head
+            && let Some(gate) = self.gates.gates.get(path)
+        {
+            self.gates.started.fetch_add(1, Ordering::SeqCst);
+            self.gates.active.fetch_add(1, Ordering::SeqCst);
+            let _active = ActivePartRead(&self.gates.active);
+            gate.acquire().await.unwrap().forget();
+            if self.gates.fail {
+                return Err(object_store::Error::NotFound {
+                    path: path.to_string(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "part removed at admission",
+                    )
+                    .into(),
+                });
+            }
+        }
+        self.inner.get_opts(path, opts).await
+    }
+    async fn put_opts(
+        &self,
+        path: &Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(path, payload, opts).await
+    }
+    async fn put_multipart_opts(
+        &self,
+        path: &Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(path, opts).await
+    }
+    fn delete_stream(
+        &self,
+        paths: futures::stream::BoxStream<'static, object_store::Result<Path>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<Path>> {
+        self.inner.delete_stream(paths)
+    }
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+#[rstest]
+#[case::ordered("ordered")]
+#[case::cancel("cancel")]
+#[case::error("error")]
+#[tokio::test]
+async fn part_admission_overlaps_within_store_budget(#[case] outcome: &str) {
+    let window = lance_io::object_store::ObjectStore::memory().io_parallelism();
+    let values: Vec<i32> = (0..=window).map(|value| value as i32).collect();
+    let dataset = dataset_of(
+        arrow_array::record_batch!(("id", Int32, values)).unwrap(),
+        LanceFileVersion::V2_1,
+    )
+    .await;
+    let store = dataset.object_store(None).await.unwrap();
+    assert_eq!(store.io_parallelism(), window);
+    let target = DataFileTarget::new(
+        None,
+        Arc::new(dataset.schema().clone()),
+        dataset.manifest.data_storage_format.lance_file_format(),
+    )
+    .unwrap();
+    let mut parts = Vec::with_capacity(window + 1);
+    for value in 0..=window {
+        parts.push(
+            write_part(
+                &dataset,
+                &target,
+                None,
+                arrow_array::record_batch!(("id", Int32, [value as i32])).unwrap(),
+            )
+            .await,
+        );
+    }
+    parts.reverse();
+    let data_dir = dataset.data_file_dir_for_base(None).unwrap();
+    let dir = target.parts_dir(&data_dir);
+    let gates = Arc::new(PartReadGates {
+        gates: parts
+            .iter()
+            .map(|part| (dir.clone().join(part.file_name.as_str()), Semaphore::new(0)))
+            .collect(),
+        started: AtomicUsize::new(0),
+        active: AtomicUsize::new(0),
+        fail: outcome == "error",
+    });
+    let wrapped = dataset.with_object_store_wrappers(vec![
+        Arc::new(PartGateWrapper(gates.clone())) as Arc<dyn WrappingObjectStore>,
+    ]);
+    let mut concat = Box::pin(wrapped.concat_data_file_parts(&target, &parts));
+    assert!(futures::poll!(concat.as_mut()).is_pending());
+    assert_eq!(gates.started.load(Ordering::SeqCst), window);
+    assert_eq!(gates.active.load(Ordering::SeqCst), window);
+    assert!(matches!(
+        store.inner.head(&target.object_path(&data_dir)).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
+    if outcome == "cancel" {
+        drop(concat);
+    } else if outcome == "error" {
+        gates.gates[&dir.clone().join(parts[0].file_name.as_str())].add_permits(1);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), concat)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("part removed at admission"),
+            "{error}"
+        );
+    } else {
+        // Finish later inputs first. The first result still blocks the output
+        // order and prevents admission of a window beyond the configured one.
+        for part in &parts[1..window] {
+            gates.gates[&dir.clone().join(part.file_name.as_str())].add_permits(1);
+        }
+        assert!(futures::poll!(concat.as_mut()).is_pending());
+        assert_eq!(gates.started.load(Ordering::SeqCst), window);
+        assert_eq!(gates.active.load(Ordering::SeqCst), 1);
+        for gate in gates.gates.values() {
+            gate.add_permits(1);
+        }
+        let data_file = tokio::time::timeout(std::time::Duration::from_secs(5), concat)
+            .await
+            .unwrap()
+            .unwrap();
+        let dataset = commit(
+            &dataset,
+            DataReplacementGroup(only_fragment(&dataset).id() as u64, data_file),
+        )
+        .await
+        .unwrap();
+        let batch = dataset.scan().try_into_batch().await.unwrap();
+        let expected: Vec<i32> = (0..=window).rev().map(|value| value as i32).collect();
+        assert_eq!(
+            batch["id"].as_primitive::<Int32Type>().values(),
+            expected.as_slice()
+        );
+    }
+    assert_eq!(gates.active.load(Ordering::SeqCst), 0);
+    if outcome != "ordered" {
+        assert!(matches!(
+            store.inner.head(&target.object_path(&data_dir)).await,
+            Err(object_store::Error::NotFound { .. })
+        ));
+    }
 }
