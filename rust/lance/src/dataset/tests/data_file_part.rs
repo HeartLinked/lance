@@ -998,6 +998,15 @@ impl WrappingObjectStore for PartGateWrapper {
             gates: self.0.clone(),
         })
     }
+
+    fn wrap_paginated(
+        &self,
+        _: &str,
+        original: Arc<dyn object_store::list::PaginatedListStore>,
+    ) -> Option<Arc<dyn object_store::list::PaginatedListStore>> {
+        // Only part GETs are gated; listings are unchanged.
+        Some(original)
+    }
 }
 
 struct ActivePartRead<'a>(&'a AtomicUsize);
