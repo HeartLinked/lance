@@ -30,6 +30,22 @@ Every definition's ID must be at most this value; `2^32 - 1` exhausts the ID spa
 Providers may store extra information in `Manifest.table_metadata`, using keys
 such as `<provider>.<clustering_id>.<key>`. Each provider defines its keys and values.
 
+#### Allocating Definitions
+
+A writer allocates definitions with the `UpdateConfig` transaction operation
+(`new_clustering_definitions`, see [Transactions](transaction.md#updateconfig)).
+The writer chooses the ids explicitly from the `max_clustering_id` it read, and
+the commit verifies that each id is exactly one above the mark of the manifest
+the transaction is applied to, in order. If a concurrent commit moved the mark,
+the transaction fails with a non-retryable commit conflict: the ids, and any
+`table_metadata` keys that embed them, were computed against a stale mark and
+must be regenerated. Because `table_metadata_updates` is part of the same
+operation, a definition and the provider metadata that refers to it are
+committed in one version; readers never see one without the other.
+
+Allocation never modifies or removes an existing definition. Dropping or
+restoring follows the rules above; the mark only moves up.
+
 ### Fragment and Index Segment Information
 
 Each fragment and index segment may set `clustering_id` to a definition in the
