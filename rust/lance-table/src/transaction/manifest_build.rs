@@ -5927,6 +5927,34 @@ mod tests {
             assert_eq!(coverage_for(&after, "idx"), None);
         }
 
+        /// Under a tagged history a segment's stored bitmap is provenance: it
+        /// keeps the retired source ids and never gains the destinations. An
+        /// index built over fragment 5, which compaction rewrote into fragment
+        /// 0, still covers every live fragment through the history, and is
+        /// credited for it.
+        #[test]
+        fn an_index_covering_the_read_version_through_a_tagged_history_is_credited() {
+            let shard = Uuid::new_v4();
+            let mut manifest = manifest_with(&[0]);
+            manifest.reader_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            manifest.writer_feature_flags |= FLAG_FRAGMENT_REUSE_INDEX;
+            let mut read = table(&[5], Uuid::new_v4(), progress(shard, 5));
+            read.push(tagged_entry(&[(&[5], &[0])]));
+            let segments_before = Transaction::logical_index_segments(&read);
+            let mut after = read.clone();
+            Transaction::apply_mem_wal_index_coverage(
+                &mut after,
+                &segments_before,
+                Some(ReadVersionState {
+                    manifest: &manifest,
+                    indices: &read,
+                }),
+                2,
+            )
+            .unwrap();
+            assert_eq!(coverage_for(&after, "idx"), Some(compacted(shard, 5)));
+        }
+
         /// The hazard that makes the comparison use whole metadata.
         ///
         /// `Operation::Update` prunes a segment's fragment bitmap in place when
