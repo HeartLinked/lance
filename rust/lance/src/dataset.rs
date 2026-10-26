@@ -4517,6 +4517,11 @@ pub(crate) async fn write_manifest_file(
             indices.as_deref().unwrap_or_default(),
         );
     }
+    // Restore and clone bypass build_manifest and may copy an older snapshot
+    // that predates the writer fence.
+    if let Some(indices) = &indices {
+        lance_table::feature_flags::apply_row_addr_index_feature_flag(manifest, indices);
+    }
     // After the flag reset, so it judges the flags being published. Here rather
     // than in `build_manifest`, which restore and clone bypass.
     crate::index::frag_reuse_with_stable_row_ids::validate_frag_reuse_with_stable_row_ids(
