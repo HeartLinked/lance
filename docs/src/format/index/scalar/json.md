@@ -24,23 +24,36 @@ not recover.
 
 ### Row Domain of the Target
 
-The JSON index's own on-disk format version (`JSON_INDEX_VERSION`, recorded in
-`IndexMetadata::index_version` of the JSON index's segment) bumps from 0 to 1
-to record the row domain of the wrapped target. A JSON index segment persisted
-at version 1 wraps a target that was itself built in the row-address domain,
-for target types that support it (see [BTree](btree.md), [Bitmap](bitmap.md),
-[LabelList](label_list.md), and, once migrated, [Inverted](fts.md),
-[NGram](ngram.md), [R-Tree](rtree.md), and [MinHash LSH](minhash_lsh.md)), on a
-dataset with stable row ids enabled. A segment persisted before version 1
-wraps a target in its pre-migration, row-id-domain floor version, regardless
-of target type.
+JSON-path indexes do not support an Inverted target (create an Inverted index
+directly on the JSON column instead), and a vector index is not a scalar-index
+plugin, so it can never be wrapped either. A JSON index can otherwise wrap any
+scalar target whose `basic_trainer` accepts the extracted Arrow type,
+including BTree, Bitmap, LabelList, ZoneMap, BloomFilter, FM, NGram, R-Tree,
+and MinHash LSH.
+
+Some of those target types have a domain fixed by the type alone, independent
+of version or dataset settings: ZoneMap, BloomFilter, and FM are always
+address-domain, with or without stable row ids, and a JSON wrapper around one
+of them is address-domain at any `JSON_INDEX_VERSION`, including 0.
+
+The remaining target types instead migrate between the row-id and
+row-address domains depending on the dataset and the build that produced
+them: BTree, Bitmap, LabelList, and, once migrated, NGram, R-Tree, and
+MinHash LSH. For only this group, the JSON index's own on-disk format version
+(`JSON_INDEX_VERSION`, recorded in `IndexMetadata::index_version` of the JSON
+index's segment) bumps from 0 to 1 to record the wrapped target's domain. A
+JSON index segment persisted at version 1 wraps a target that was itself
+built in the row-address domain, on a dataset with stable row ids enabled; a
+segment persisted before version 1 wraps a target in its pre-migration,
+row-id-domain floor version.
 
 Because the JSON wrapper and its target index are always written by the same
-build, the wrapper segment's own `index_version` is sufficient to recover the
-target's domain: a reader does not need to separately store or infer the
-target's own version. This lifts the restriction under which a JSON-wrapped
-BTree, Bitmap, or LabelList target could not be created or optimized in the
-row-address domain on a stable-row-id dataset.
+build, the wrapper segment's own `index_version` is sufficient to recover a
+migrating target's domain: a reader does not need to separately store or
+infer the target's own version, and must not apply this floor-version rule to
+a target type that is always address-domain. This lifts the restriction
+under which a JSON-wrapped BTree, Bitmap, or LabelList target could not be
+created or optimized in the row-address domain on a stable-row-id dataset.
 
 ## Index Details
 

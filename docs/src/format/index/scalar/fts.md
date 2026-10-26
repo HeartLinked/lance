@@ -20,7 +20,7 @@ The FTS index consists of multiple files storing the token dictionary, document 
 
 An FTS index may contain multiple partitions. Each partition has its own set of token, document, and posting list files, prefixed with the partition ID (e.g. `part_0_tokens.lance`, `part_0_docs.lance`, `part_0_invert.lance`). The `metadata.lance` file lists all partition IDs in the index. At query time, every partition must be searched and the results combined to produce the final ranked output. Fewer partitions generally means better query performance, since each partition requires its own token dictionary lookup and posting list scan. The number of partitions is controlled by the training configuration -- specifically `LANCE_FTS_TARGET_SIZE` determines how large each merged partition can grow (see [Training Process](#training-process) for details).
 
-From format version 4 (`INVERTED_INDEX_VERSION_V4`) onward, a segment built on a dataset with stable row ids enabled stores physical row addresses (`fragment_id << 32 | offset`) in `_rowid` and in the delta-encoded posting-list identifiers, instead of the dataset's logical row id; without stable row ids a row id and a row address are the same value, so the pre-migration version is kept. A segment persisted before version 4 (`IndexMetadata::index_version`) stores row ids throughout. All partitions written by one build share the segment's domain.
+From format version 4 (`INVERTED_INDEX_VERSION_V4`) onward, a segment built on a dataset with stable row ids enabled stores a physical row address (`fragment_id << 32 | offset`) in `docs.lance._rowid` instead of the dataset's logical row id; without stable row ids a row id and a row address are the same value, so the pre-migration version is kept. A segment persisted before version 4 (`IndexMetadata::index_version`) stores a row id there instead. This is the only column the migration touches: the posting lists in `invert.lance` are keyed by partition-local document IDs, not by row id or row address (see below), so their encoding is unaffected. All partitions written by one build share the segment's domain.
 
 ### Token Dictionary File Schema
 
@@ -49,7 +49,7 @@ loaded, is file corruption.
 
 | Column                 | Type                    | Nullable | Description                                                      |
 |------------------------|-------------------------|----------|------------------------------------------------------------------|
-| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded row addresses and frequencies from format version 4 onward; delta-encoded row ids in a segment persisted before version 4) |
+| `_posting`             | List<LargeBinary>       | false    | Compressed posting lists (delta-encoded document IDs and frequencies). A document ID is a dense, partition-local `u32` assigned when the document is appended, not a row id or row address; it is resolved to the document's row through `docs.lance._rowid`. Unaffected by the row-address migration described above. |
 | `_max_score`           | Float32                 | false    | Maximum score for the token (for query optimization)             |
 | `_length`              | UInt32                  | false    | Number of documents containing the token                         |
 | `_compressed_position` | List<List<LargeBinary>> | true     | Optional compressed position lists for phrase queries            |
