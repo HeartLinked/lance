@@ -50,8 +50,9 @@ use crate::index::{DatasetIndexExt, DatasetIndexInternalExt};
 /// the same query is not supported.
 ///
 /// Under stable row ids each segment's row-id hits (and lookup matches) are restricted to
-/// the rows currently stored in its own fragments before the results are combined (see
-/// `SegmentCoverage`).
+/// the live rows currently stored in its own fragments before the results are combined (see
+/// `SegmentCoverage`). This drops deleted rows too, but only here: an index with a single
+/// segment is opened without this wrapper and returns its segment's results unrestricted.
 ///
 /// This is a read-only wrapper. [`ScalarIndex::remap`] and [`ScalarIndex::update`] both return
 /// an error — callers must rebuild the index to consolidate segments before mutating it.
@@ -2557,7 +2558,7 @@ mod tests {
                 .try_collect()
                 .await
                 .unwrap();
-            let mut live = Vec::new();
+            let mut matches = Vec::new();
             for batch in &batches {
                 let key_indices = batch.column(0).as_primitive::<UInt32Type>();
                 let rows = batch.column(1).as_primitive::<UInt64Type>();
@@ -2570,12 +2571,11 @@ mod tests {
                         .await
                         .unwrap()
                         .is_some_and(|deletions| deletions.contains(row.row_offset()));
-                    if !deleted {
-                        live.push(*key_index);
-                    }
+                    matches.push((*key_index, deleted));
                 }
             }
-            assert_eq!(live, vec![1]);
+            matches.sort_unstable();
+            assert_eq!(matches, vec![(0, true), (1, false)]);
         }
     }
 }

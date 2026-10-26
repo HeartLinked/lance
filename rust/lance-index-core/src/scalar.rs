@@ -736,8 +736,9 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
     /// and `0.0` are distinct and NaN matches NaN. A null key never matches,
     /// not even a null indexed value. `keys` must have the index's value type.
     ///
-    /// Like [`Self::search`], the rows are not filtered by deletions, and any
-    /// fragment-reuse remapping the index was loaded with is already applied.
+    /// Like [`Self::search`], the rows may include deleted rows, so callers
+    /// must filter them, and any fragment-reuse remapping the index was loaded
+    /// with is already applied.
     ///
     /// Indices that cannot answer exact-equality lookups return
     /// [`Error::NotSupported`], which is the default.
