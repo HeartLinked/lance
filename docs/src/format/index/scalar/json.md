@@ -31,29 +31,40 @@ scalar target whose `basic_trainer` accepts the extracted Arrow type,
 including BTree, Bitmap, LabelList, ZoneMap, BloomFilter, FM, NGram, R-Tree,
 and MinHash LSH.
 
-Some of those target types have a domain fixed by the type alone, independent
-of version or dataset settings: ZoneMap, BloomFilter, and FM are always
-address-domain, with or without stable row ids, and a JSON wrapper around one
-of them is address-domain at any `JSON_INDEX_VERSION`, including 0.
+Unlike a standalone index, a JSON-wrapped target has no `IndexMetadata` entry
+of its own to record a version in, and most target types do not otherwise
+self-describe their version inside their own files: BTree, for example, is
+simply told its domain by the version number its caller passes in, rather
+than reading it back from `page_lookup.lance` or `page_data.lance` (MinHash
+LSH, which stamps `minhash_lsh_index_version` into its own file metadata, is
+the one exception). So the target's own version has to be recorded somewhere
+in `JsonIndexDetails` itself: a new field, `target_index_version`, holds the
+version the target was actually built at -- the same number that would sit in
+`IndexMetadata::index_version` for a standalone instance of that type.
+`target_index_version` is absent on a JSON index built before this field
+existed; a reader then falls back to the legacy, per-target-type floor
+version it already applies today: the row-id-domain floor version for BTree,
+Bitmap, and LabelList (the only target types a pre-existing JSON index could
+have trained in the address domain without recording it), and the target
+plugin's one and only version for every other target type.
 
-The remaining target types instead migrate between the row-id and
-row-address domains depending on the dataset and the build that produced
-them: BTree, Bitmap, LabelList, and, once migrated, NGram, R-Tree, and
-MinHash LSH. For only this group, the JSON index's own on-disk format version
-(`JSON_INDEX_VERSION`, recorded in `IndexMetadata::index_version` of the JSON
-index's segment) bumps from 0 to 1 to record the wrapped target's domain. A
-JSON index segment persisted at version 1 wraps a target that was itself
-built in the row-address domain, on a dataset with stable row ids enabled; a
-segment persisted before version 1 wraps a target in its pre-migration,
-row-id-domain floor version.
+`target_data_type` completes the description of the *extracted values*;
+`target_index_version` completes the description of the target index itself,
+so the two fields together make `JsonIndexDetails` a lossless description of
+which on-disk format the wrapped target uses. This also lifts the
+restriction under which a JSON-wrapped BTree, Bitmap, or LabelList target
+could not be created or optimized in the row-address domain on a
+stable-row-id dataset: once the version is recorded explicitly, there is
+nothing left to infer.
 
-Because the JSON wrapper and its target index are always written by the same
-build, the wrapper segment's own `index_version` is sufficient to recover a
-migrating target's domain: a reader does not need to separately store or
-infer the target's own version, and must not apply this floor-version rule to
-a target type that is always address-domain. This lifts the restriction
-under which a JSON-wrapped BTree, Bitmap, or LabelList target could not be
-created or optimized in the row-address domain on a stable-row-id dataset.
+`target_index_version` does not affect `JSON_INDEX_VERSION` itself, which
+tracks the JSON wrapper's own on-disk format and is unrelated to the target's
+version; nor does it change how an old reader decides whether it can safely
+skip a JSON index whose target it does not understand. That decision is
+based on the target plugin's own declared maximum version, looked up by
+decoding `target_details`' `type_url`, exactly as query routing and
+`load_index` already do -- not on `JSON_INDEX_VERSION`, which says nothing
+about the target type and is unaffected by a target's own version changes.
 
 ## Index Details
 
@@ -75,7 +86,9 @@ example [BTree](btree.md) or [Bitmap](bitmap.md).
 Reader navigation therefore has two steps. Decode `JsonIndexDetails` to recover
 `path` and `target_details`, select the target implementation from the
 `type_url` of `target_details`, then navigate the target index exactly as a
-standalone index of that type, using `target_details` as its details.
+standalone index of that type, using `target_details` as its details and
+`target_index_version` (see [Row Domain of the Target](#row-domain-of-the-target))
+as its version.
 
 ## Accelerated Queries
 

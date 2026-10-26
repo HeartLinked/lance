@@ -452,3 +452,35 @@ stored in the `_rowid` column of `signatures.lance`:
 - **Segment merging** combines only segments of identical domain: a merge
   never mixes a row-id-domain segment with a row-address-domain one, matching
   the rule already applied to BTree, Bitmap, and LabelList segments.
+
+The column itself keeps the name `_rowid` in both versions -- only the
+domain of the values changes, matching every other index in this family
+(BTree's `ids` column and Bitmap's `bitmaps` column are not renamed either).
+`signatures.lance`'s schema at version 1 is therefore identical to
+[Version 0](#signature-file-schema) except for the stamped version number:
+
+```python
+pa.schema(
+    [
+        pa.field("_rowid", pa.uint64(), nullable=False),
+        pa.field(
+            "signature",
+            pa.list_(pa.field("item", pa.uint16(), nullable=False), num_hashes),
+            nullable=False,
+            metadata={
+                "lance-encoding:structural-encoding": "fullzip",
+                "lance-encoding:compression": "none",
+            },
+        ),
+    ],
+    metadata={
+        "minhash_lsh_details": "<hexadecimal serialized MinHashLshIndexDetails>",
+        "minhash_lsh_index_version": "1",
+    },
+)
+```
+
+`bands.lance` is unaffected: it holds no row ids or addresses (only
+`band_key` and the segment-local `doc_id`), so its schema is unchanged. It is
+still stamped `"minhash_lsh_index_version": "1"`, since both files of a
+segment repeat the same file format version (see above).
