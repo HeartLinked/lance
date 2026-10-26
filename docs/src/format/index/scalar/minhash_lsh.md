@@ -133,9 +133,9 @@ always comparable. Changing a parameter requires rebuilding the index.
 ## Storage Layout
 
 From format version 1 (`minhash_lsh_index_version`) onward, `signatures.lance`'s
-row-identifier column is renamed from `_rowid` to `id`, and a segment built on
-a dataset with stable row ids enabled stores the physical row address
-(`fragment_id << 32 | offset`) of each document in it, instead of the
+row-identifier column is renamed from `_rowid` to `address`, and a segment
+built on a dataset with stable row ids enabled stores the physical row
+address (`fragment_id << 32 | offset`) of each document in it, instead of the
 dataset's logical row id; without stable row ids a row id and a row address
 are the same value, so the pre-migration version is kept, with the column
 still named `_rowid`. A segment persisted before version 1 is described in
@@ -146,7 +146,7 @@ changes from version 0.
 Each segment consists of two Lance files:
 
 - `signatures.lance` — one row per indexed document: its row identifier
-  (`id` from format version 1 onward, `_rowid` before it) and its
+  (`address` from format version 1 onward, `_rowid` before it) and its
   signature as a fixed-size list of `num_hashes` 16-bit values. The row number
   is the segment-local document id, so a segment holds at most `2^32`
   documents; larger tables use several segments. Rows are fixed width and
@@ -336,8 +336,8 @@ pa.schema(
 `_rowid` is the row id of the indexed row as the dataset hands it to the
 index: the row address, or the stable row id when the dataset has stable row
 ids enabled, like every scalar index before its own migration to the
-row-address domain. From format version 1, this column is renamed `id` and
-takes on a narrower meaning; see
+row-address domain. From format version 1, this column is renamed `address`
+and takes on a narrower meaning; see
 [Version 1: Row-Address Domain](#version-1-row-address-domain). `signature` is the signature of the
 [Signature Procedure](#signature-procedure); its values are never null (the
 Lance schema does not record the nullability of a fixed-size list item, so a
@@ -433,9 +433,9 @@ with a null value is corruption of `signatures.lance`.
 
 The fragments a segment covers are recorded in the index metadata of the
 dataset, never derived from the stored row-identifier column (`_rowid` before
-format version 1, `id` from version 1 on), which does not identify fragments
-once stable row ids are enabled, prior to a segment's own migration to the
-row-address domain.
+format version 1, `address` from version 1 on), which does not identify
+fragments once stable row ids are enabled, prior to a segment's own migration
+to the row-address domain.
 
 ## Version 1: Row-Address Domain
 
@@ -443,27 +443,28 @@ This section is normative for `minhash_lsh_index_version = 1`. It changes two
 things in [Version 0 Reference](#version-0-reference), both confined to
 `signatures.lance`'s row-identifier column:
 
-- **The column is renamed** from `_rowid` to `id`. `_rowid` is the name Lance
-  uses elsewhere for a column that specifically holds the dataset's logical
-  row id (as opposed to `_rowaddr`, the dataset's physical row address); once
-  this column can hold either, depending on `minhash_lsh_index_version`, that
-  name is no longer accurate. `id` makes no claim about which domain applies,
-  matching BTree's `ids` and R-Tree's `id` -- the same generic naming already
-  used for a column whose domain is established by the index's own version,
-  not by its name.
-- **Its values change domain.** On a dataset with stable row ids enabled, `id`
-  holds the physical row address (`fragment_id << 32 | offset`) of the
-  indexed row rather than its stable row id. On a dataset without stable row
-  ids, a row id and a row address are the same value, so a segment is still
-  written at version 0 with the column named `_rowid`.
+- **The column is renamed** from `_rowid` to `address`, and the rename is
+  unconditional, not merely a relabeling of the same ambiguous content: a
+  segment is only ever persisted at version 1 on a dataset with stable row
+  ids enabled (see below), which is exactly the condition under which a row
+  id and a row address diverge. So whenever this version -- and therefore
+  this column name -- appears, the column unconditionally holds a physical
+  row address; `_rowid`, which holds either depending on dataset settings,
+  remains the correct name for the unmigrated, version-0 column.
+- **Its values become row addresses.** `address` holds the physical row
+  address (`fragment_id << 32 | offset`) of the indexed row rather than its
+  stable row id. On a dataset without stable row ids, a row id and a row
+  address are the same value, so there is nothing to gain from the new
+  format and a segment is still written at version 0 with the column named
+  `_rowid`.
 
 Everything else is unchanged from version 0:
 
 - The signature procedure, the band keys, `bands.lance`, the page table, and
   every other schema metadata key are identical to version 0.
 - A reader opens a version 1 segment exactly as a version 0 segment (see
-  [Opening a Segment](#opening-a-segment)), substituting `id` for `_rowid`
-  when validating the schema; a reader determines which name and
+  [Opening a Segment](#opening-a-segment)), substituting `address` for
+  `_rowid` when validating the schema; a reader determines which name and
   interpretation apply from `minhash_lsh_index_version` alone, never from the
   stored values or the presence of either column name on their own.
 - **Segment merging** combines only segments of identical domain: a merge
@@ -477,7 +478,7 @@ stamped version number:
 ```python
 pa.schema(
     [
-        pa.field("id", pa.uint64(), nullable=False),
+        pa.field("address", pa.uint64(), nullable=False),
         pa.field(
             "signature",
             pa.list_(pa.field("item", pa.uint16(), nullable=False), num_hashes),
