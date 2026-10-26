@@ -7377,6 +7377,94 @@ mod tests {
             .unwrap();
     }
 
+    #[tokio::test]
+    async fn repro_eager_compaction_over_undrained_v0_fri_without_stable_row_ids() {
+        let mut dataset = lance_datagen::gen_batch()
+            .col("i", lance_datagen::array::step::<Int32Type>())
+            .into_dataset_with_params(
+                "memory://",
+                FragmentCount::from(6),
+                FragmentRowCount::from(10),
+                Some(WriteParams {
+                    max_rows_per_file: 10,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        dataset
+            .create_index(
+                &["i"],
+                IndexType::BTree,
+                Some("i_idx".into()),
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Deferred: 6 x 10-row fragments -> 3 x 20-row fragments, v0 FRI written.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 20,
+                defer_index_remap: true,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let fri = dataset.frag_reuse_index().await.unwrap().unwrap();
+        assert!(!fri.is_empty());
+
+        // Eager: merges the FRI destinations again while the FRI is undrained.
+        compact_files(
+            &mut dataset,
+            CompactionOptions {
+                target_rows_per_fragment: 1_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        let live: Vec<u64> = dataset
+            .get_fragments()
+            .iter()
+            .map(|f| f.id() as u64)
+            .collect();
+
+        for value in [0, 7, 25, 59] {
+            let mut scanner = dataset.scan();
+            scanner
+                .filter(&format!("i = {value}"))
+                .unwrap()
+                .project(&["i"])
+                .unwrap()
+                .with_row_address();
+            let plan = scanner.explain_plan(false).await.unwrap();
+            let batch = scanner.try_into_batch().await;
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(e) => panic!("i = {value}: query failed: {e}\nplan: {plan}\nlive: {live:?}"),
+            };
+            let addrs: Vec<u64> = batch
+                .column_by_name(lance_core::ROW_ADDR)
+                .unwrap()
+                .as_primitive::<UInt64Type>()
+                .values()
+                .to_vec();
+            let values: Vec<i32> = batch["i"].as_primitive::<Int32Type>().values().to_vec();
+            let frags: Vec<u64> = addrs.iter().map(|a| a >> 32).collect();
+            assert_eq!(
+                values,
+                vec![value],
+                "i = {value}: got values {values:?} at fragments {frags:?}; live {live:?}\nplan: {plan}"
+            );
+        }
+    }
+
     /// A table whose only index can never consume an eager remap (ZoneMap
     /// always reports `RemapResult::Drop`) still has to honor row-address
     /// moves its tasks recorded under `defer_index_remap` at plan/execution
