@@ -133,20 +133,14 @@ always comparable. Changing a parameter requires rebuilding the index.
 ## Storage Layout
 
 From format version 1 (`minhash_lsh_index_version`) onward, `signatures.lance`'s
-row-identifier column is renamed from `_rowid` to `address`, and a segment
-built on a dataset with stable row ids enabled stores the physical row
-address (`fragment_id << 32 | offset`) of each document in it, instead of the
-dataset's logical row id; without stable row ids a row id and a row address
-are the same value, so the pre-migration version is kept, with the column
-still named `_rowid`. A segment persisted before version 1 is described in
-[Version 0 Reference](#version-0-reference); see
-[Version 1: Row-Address Domain](#version-1-row-address-domain) for the two
-changes from version 0.
+row-identifier column is renamed from `_rowid` to `_rowaddr`, and a segment
+stores the physical row address (`fragment_id << 32 | offset`) of each document
+in it, instead of the dataset's logical row id.
 
 Each segment consists of two Lance files:
 
 - `signatures.lance` — one row per indexed document: its row identifier
-  (`address` from format version 1 onward, `_rowid` before it) and its
+  (`_rowaddr` from format version 1 onward, `_rowid` before it) and its
   signature as a fixed-size list of `num_hashes` 16-bit values. The row number
   is the segment-local document id, so a segment holds at most `2^32`
   documents; larger tables use several segments. Rows are fixed width and
@@ -214,13 +208,12 @@ When a search is submitted (`nearest = MinHashQuery(text, column)`):
   index's own `_indices/{uuid}/` directory, and no data file, manifest field
   or other index is rewritten.
 
-## Version 0 Reference
+## Signature Version 0 Reference
 
-This section is normative for `signature_version = 0` and
-`minhash_lsh_index_version = 0`: an independent implementation must reproduce
-the signatures, band keys and files defined here exactly. All arithmetic is on
-unsigned 64-bit integers modulo `2^64`, and every multi-byte value is
-little-endian.
+This section is normative for `signature_version = 0`: an independent
+implementation must reproduce the signatures, band keys and files defined here
+exactly. All arithmetic is on unsigned 64-bit integers modulo `2^64`, and every
+multi-byte value is little-endian.
 
 ### Signature Procedure
 
@@ -315,7 +308,7 @@ reordered.
 ```python
 pa.schema(
     [
-        pa.field("_rowid", pa.uint64(), nullable=False),
+        pa.field("_rowaddr", pa.uint64(), nullable=False),
         pa.field(
             "signature",
             pa.list_(pa.field("item", pa.uint16(), nullable=False), num_hashes),
@@ -328,17 +321,14 @@ pa.schema(
     ],
     metadata={
         "minhash_lsh_details": "<hexadecimal serialized MinHashLshIndexDetails>",
-        "minhash_lsh_index_version": "0",
+        "minhash_lsh_index_version": "1",
     },
 )
 ```
 
-`_rowid` is the row id of the indexed row as the dataset hands it to the
-index: the row address, or the stable row id when the dataset has stable row
-ids enabled, like every scalar index before its own migration to the
-row-address domain. From format version 1, this column is renamed `address`
-and takes on a narrower meaning; see
-[Version 1: Row-Address Domain](#version-1-row-address-domain). `signature` is the signature of the
+`_rowid`/`_rowaddr` is the identifier of the indexed row as the dataset hands
+it to the index: the row address (when version >= 1), or the row id
+(when version = 0).  `signature` is the signature of the
 [Signature Procedure](#signature-procedure); its values are never null (the
 Lance schema does not record the nullability of a fixed-size list item, so a
 reader treats a null value as corruption of the file). The field metadata of
@@ -369,7 +359,7 @@ pa.schema(
     ],
     metadata={
         "minhash_lsh_details": "<hexadecimal serialized MinHashLshIndexDetails>",
-        "minhash_lsh_index_version": "0",
+        "minhash_lsh_index_version": "1",
         "minhash_lsh_num_docs": "<decimal document count>",
         "minhash_lsh_page_rows": "4096",
         "minhash_lsh_page_table_buffer": "<decimal global buffer index>",
@@ -390,7 +380,7 @@ bucket may span any number of pages.
 | Key                             | File    | Value                                                                                                                                                                                                          |
 |:--------------------------------|:--------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `minhash_lsh_details`           | both    | Lower-case hexadecimal encoding of the serialized `MinHashLshIndexDetails` the segment was built from. A reader decodes it and requires it to describe, field by field, the same details as the index metadata. |
-| `minhash_lsh_index_version`     | both    | Decimal file layout version; `0` for the layout described here. Independent of `signature_version`.                                                                                                           |
+| `minhash_lsh_index_version`     | both    | Decimal file layout version; This is equivalent to the version in the `IndexMetadata`                                                                                                           |
 | `minhash_lsh_num_docs`          | `bands` | Decimal number of documents of the segment; equals the row count of `signatures.lance`.                                                                                                                       |
 | `minhash_lsh_page_rows`         | `bands` | Decimal number of rows per logical page; positive. Writers use `4096`.                                                                                                                                        |
 | `minhash_lsh_page_table_buffer` | `bands` | Decimal index of the global buffer of `bands.lance` that holds the page table.                                                                                                                                |
@@ -430,73 +420,3 @@ While answering queries, a page that does not decode to non-null `UInt64`
 and `UInt32` columns, and a `doc_id` that is not below
 `minhash_lsh_num_docs`, are corruption of `bands.lance`; a signature batch
 with a null value is corruption of `signatures.lance`.
-
-The fragments a segment covers are recorded in the index metadata of the
-dataset, never derived from the stored row-identifier column (`_rowid` before
-format version 1, `address` from version 1 on), which does not identify
-fragments once stable row ids are enabled, prior to a segment's own migration
-to the row-address domain.
-
-## Version 1: Row-Address Domain
-
-This section is normative for `minhash_lsh_index_version = 1`. It changes two
-things in [Version 0 Reference](#version-0-reference), both confined to
-`signatures.lance`'s row-identifier column:
-
-- **The column is renamed** from `_rowid` to `address`, and the rename is
-  unconditional, not merely a relabeling of the same ambiguous content: a
-  segment is only ever persisted at version 1 on a dataset with stable row
-  ids enabled (see below), which is exactly the condition under which a row
-  id and a row address diverge. So whenever this version -- and therefore
-  this column name -- appears, the column unconditionally holds a physical
-  row address; `_rowid`, which holds either depending on dataset settings,
-  remains the correct name for the unmigrated, version-0 column.
-- **Its values become row addresses.** `address` holds the physical row
-  address (`fragment_id << 32 | offset`) of the indexed row rather than its
-  stable row id. On a dataset without stable row ids, a row id and a row
-  address are the same value, so there is nothing to gain from the new
-  format and a segment is still written at version 0 with the column named
-  `_rowid`.
-
-Everything else is unchanged from version 0:
-
-- The signature procedure, the band keys, `bands.lance`, the page table, and
-  every other schema metadata key are identical to version 0.
-- A reader opens a version 1 segment exactly as a version 0 segment (see
-  [Opening a Segment](#opening-a-segment)), substituting `address` for
-  `_rowid` when validating the schema; a reader determines which name and
-  interpretation apply from `minhash_lsh_index_version` alone, never from the
-  stored values or the presence of either column name on their own.
-- **Segment merging** combines only segments of identical domain: a merge
-  never mixes a version-0 segment with a version-1 one, matching the rule
-  already applied to BTree, Bitmap, and LabelList segments.
-
-`signatures.lance`'s schema at version 1 is therefore identical to
-[Version 0](#signature-file-schema) except for the renamed column and the
-stamped version number:
-
-```python
-pa.schema(
-    [
-        pa.field("address", pa.uint64(), nullable=False),
-        pa.field(
-            "signature",
-            pa.list_(pa.field("item", pa.uint16(), nullable=False), num_hashes),
-            nullable=False,
-            metadata={
-                "lance-encoding:structural-encoding": "fullzip",
-                "lance-encoding:compression": "none",
-            },
-        ),
-    ],
-    metadata={
-        "minhash_lsh_details": "<hexadecimal serialized MinHashLshIndexDetails>",
-        "minhash_lsh_index_version": "1",
-    },
-)
-```
-
-`bands.lance` is unaffected: it holds no row ids or addresses (only
-`band_key` and the segment-local `doc_id`), so its schema is unchanged. It is
-still stamped `"minhash_lsh_index_version": "1"`, since both files of a
-segment repeat the same file format version (see above).

@@ -66,11 +66,9 @@ The R-Tree index consists of two files:
 1. `page_data.lance` - Stores all pages (leaf, branch) as repeated `(bbox, id)` tuples, written bottom-up (leaves first, then branch levels)
 2. `nulls.lance` - Stores a serialized RowAddrTreeMap of rows with null
 
-From format version 1 (`RTREE_INDEX_VERSION`) onward, a segment built on a
-dataset with stable row ids enabled stores physical row addresses in the
-leaf `id` column and in `nulls.lance` instead of the dataset's logical row
-id; without stable row ids a row id and a row address are the same value, so
-the pre-migration version is kept.
+From format version 1 (`RTREE_INDEX_VERSION`) onward, a segment stores physical
+row addresses in the leaf `id` column and in `nulls.lance` instead of the dataset's
+logical row id.
 
 ### Page File Schema
 

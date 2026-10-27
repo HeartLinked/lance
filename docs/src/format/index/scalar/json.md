@@ -65,8 +65,7 @@ Reader navigation therefore has two steps. Decode `JsonIndexDetails` to recover
 `path` and `target_details`, select the target implementation from the
 `type_url` of `target_details`, then navigate the target index exactly as a
 standalone index of that type, using `target_details` as its details and
-`target_index_version` (see [Row Domain of the Target](#row-domain-of-the-target))
-as its version.
+`target_index_version` as its version.
 
 ## Accelerated Queries
 

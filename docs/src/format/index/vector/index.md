@@ -54,25 +54,10 @@ This document currently only records version 3 which is the latest version.
 The specific version of the vector index is recorded in the `index_version` field of the generic [index metadata](../index.md#loading-an-index).
 
 `index_version` also tracks the row domain of the auxiliary file's `_rowid`
-column. `VectorIndexDetails` does not record which quantization subtype a
-segment uses, so a reader's compatibility check (`unsupported_index_version`)
-compares every vector segment's `index_version` against the single global
-`IndexType::max_vector_version()` rather than a per-subtype maximum (see
-[#6097](https://github.com/lance-format/lance/pull/6097)). That global maximum
-is already 2, from `IVF_RQ_INDEX_VERSION`, so a released reader accepts any
-vector segment up to version 2 for *every* subtype, not just RQ. Marking the
-row-address domain with version 2 for FLAT, PQ, SQ, or HNSW would therefore be
-silently accepted by readers that do not understand it, misreading addresses
-as row ids.
-
-The row-address domain instead uses the next unused global level, version 3,
-for every subtype: both `VECTOR_INDEX_VERSION` (FLAT, PQ, SQ, HNSW) and
-`IVF_RQ_INDEX_VERSION` (RQ) bump to 3. From version 3 onward, a segment built
-on a dataset with stable row ids enabled stores the physical row address
-(`fragment_id << 32 | offset`) of each vector in `_rowid` instead of the
-dataset's logical row id; without stable row ids a row id and a row address
-are the same value, so the pre-migration version is kept. A segment persisted
-below version 3 stores row ids throughout, and merging never combines
+or `_rowaddr` column. From version 3 onward, a segment built on a dataset with
+stable row ids enabled stores the physical row address (`fragment_id << 32 | offset`)
+of each vector in `_rowaddr` instead of the dataset's logical row id in `_rowid`. A
+segment persisted below version 3 stores row ids throughout, and merging never combines
 segments of differing domain.
 
 ## Storage Layout (V3)
@@ -200,10 +185,11 @@ on that ordering to identify them.
 
 No quantization applied - stores original vectors in their full precision:
 
-| Column   | Type                     | Nullable | Description                                           |
-| -------- | ------------------------ | -------- | ----------------------------------------------------- |
-| `_rowid` | uint64                   | true     | Row identifier (a physical row address from `VECTOR_INDEX_VERSION` 3 onward; a row id in a segment persisted at version 1) |
-| `flat`   | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
+| Column     | Type                     | Nullable | Description                                           |
+| ---------- | ------------------------ | -------- | ----------------------------------------------------- |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
+| `flat`     | list<float32>[dimension] | true     | Original vector values (list_size = vector dimension) |
 
 ##### PQ
 
@@ -211,7 +197,8 @@ Compresses vectors using product quantization for significant memory savings:
 
 | Column      | Type                                            | Nullable | Description                                   |
 | ----------- | ----------------------------------------------- | -------- | --------------------------------------------- |
-| `_rowid`    | uint64                                          | true     | Row identifier (a physical row address from `VECTOR_INDEX_VERSION` 3 onward; a row id in a segment persisted at version 1) |
+| `_rowid`   | uint64                   | true     | Row identifier (present when version <= 2) |
+| `_rowaddr` | uint64                   | true     | Row address (present when version >= 3) |
 | `__pq_code` | list<uint8>[num_sub_vectors * num_bits / 8]     | true     | PQ codes, packed to `num_bits` per subvector  |
 
 ##### SQ
@@ -220,7 +207,8 @@ Compresses vectors using scalar quantization for moderate memory savings:
 
 | Column      | Type                   | Nullable | Description                             |
 | ----------- | ---------------------- | -------- | --------------------------------------- |
-| `_rowid`    | uint64                 | true     | Row identifier (a physical row address from `VECTOR_INDEX_VERSION` 3 onward; a row id in a segment persisted at version 1) |
+| `_rowid`    | uint64                 | true     | Row identifier (present when version <= 2) |
+| `_rowaddr`  | uint64                 | true     | Row address (present when version >= 3) |
 | `__sq_code` | list<uint8>[dimension] | true     | SQ codes (list_size = vector dimension) |
 
 ##### RQ

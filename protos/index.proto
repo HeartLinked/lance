@@ -306,6 +306,10 @@ message JsonIndexDetails {
    * rebuild happens to see. See JSON_TARGET_DATA_TYPE_UNSPECIFIED for how to
    * recover the type when it is absent.
    *
+   * This completes the description of the extracted values only. These details
+   * still do not record the target index's format version, so they are not a
+   * general, lossless description of the index and must not be read as one.
+   *
    * An implementation that rewrites these details without retraining the target
    * index -- compacting or updating it -- must preserve a recorded type
    * exactly. Every value other than JSON_TARGET_DATA_TYPE_UNSPECIFIED is
@@ -318,27 +322,6 @@ message JsonIndexDetails {
    * may replace it.
    */
   JsonTargetDataType target_data_type = 3;
-
-  /* The on-disk format version the target index was built at: the same value
-   * that would be stored in `IndexMetadata::index_version` for a standalone
-   * instance of the target type, e.g. `BTREE_ROW_ADDR_DOMAIN_VERSION` for a
-   * target trained in the row-address domain.
-   *
-   * This is the only record of the target's own version: unlike a standalone
-   * index, a JSON-wrapped target has no `IndexMetadata` entry of its own, and
-   * most target types do not otherwise self-describe their version inside
-   * their own files (MinHash LSH is the one exception, via
-   * `minhash_lsh_index_version`). Absent for a JSON index built before this
-   * field existed; a reader must then fall back to the legacy, per-target-type
-   * floor version it already applies in that case -- the row-id-domain floor
-   * version for BTree, Bitmap, and LabelList, and the target plugin's original
-   * (pre-migration) version for every other target type.
-   *
-   * An implementation that rewrites these details without retraining the
-   * target -- compacting or updating it -- must preserve a recorded value
-   * exactly, like `target_data_type` above.
-   */
-  optional uint32 target_index_version = 4;
 }
 message BloomFilterIndexDetails {}
 
