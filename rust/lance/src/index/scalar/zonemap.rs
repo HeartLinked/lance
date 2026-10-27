@@ -144,13 +144,12 @@ tokio::task_local! {
     pub static SEED_REUSE_REPORTS: std::sync::Mutex<Vec<SeedReuseReport>>;
 }
 
-/// The physical row count of `fragment`: the manifest's, else the serving
-/// file's footer. Established before any seed decision so every zone's
-/// length is known.
+/// The physical row count of `fragment`, established before any seed
+/// decision so every zone's length is known. Resolved through
+/// [`FileFragment::physical_rows`], which serves the manifest's count
+/// without I/O only when the manifest's writer version makes it
+/// trustworthy and otherwise reads a data file's footer.
 async fn physical_rows(dataset: &Dataset, fragment: &Fragment) -> Result<u64> {
-    if let Some(rows) = fragment.physical_rows {
-        return Ok(rows as u64);
-    }
     let file_fragment = dataset.get_fragment(fragment.id as usize).ok_or_else(|| {
         Error::invalid_input(format!("fragment {} is not in the dataset", fragment.id))
     })?;

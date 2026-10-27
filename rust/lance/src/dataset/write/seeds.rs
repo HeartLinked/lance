@@ -72,7 +72,7 @@ impl SeedCollector {
 
         let indices = load_all_indices(dataset).await?;
         let manifest = dataset.manifest.as_ref();
-        let writers = seed_writers_for(dataset, &indices, write_schema)
+        let writers = seed_writers_for(dataset, &indices, write_schema, SeedWriterPurpose::Collect)
             .await?
             .into_iter()
             .filter(|writer| {
@@ -138,10 +138,23 @@ impl SeedCollector {
 /// `dataset` resolves index details that are not inline in the metadata; it
 /// only has to share its index store with `indices`, which may belong to a
 /// manifest that is still being built.
+/// Why seed writers are being selected.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeedWriterPurpose {
+    /// Embedding seeds in a file being written: each writer is fully
+    /// configured, which for a zone map includes the null-position policy
+    /// stored in its index file.
+    Collect,
+    /// Computing the feature flags the seed formats require. The flags do
+    /// not depend on the null-position policy, so no index file is read.
+    FeatureFlags,
+}
+
 async fn seed_writers_for(
     dataset: &Dataset,
     indices: &[IndexMetadata],
     schema: &Schema,
+    purpose: SeedWriterPurpose,
 ) -> Result<Vec<Box<dyn IndexSeedWriter>>> {
     let mut writers: Vec<Box<dyn IndexSeedWriter>> = Vec::new();
     // Zone map requirements per column: every ZoneMap index on the column
@@ -177,16 +190,21 @@ async fn seed_writers_for(
             // The policy is optional metadata: a segment that cannot be read
             // right now costs this file its seed for that index, never the
             // write itself.
-            let positions = match stored_null_bitmap_policy(dataset, index).await {
-                Ok(positions) => positions,
-                Err(err) => {
-                    log::warn!(
-                        "column {}: zone map {} could not be read ({err}); no zone map seed is \
-                         written for it in this file",
-                        field.name,
-                        index.name
-                    );
-                    continue;
+            let positions = match purpose {
+                SeedWriterPurpose::FeatureFlags => false,
+                SeedWriterPurpose::Collect => {
+                    match stored_null_bitmap_policy(dataset, index).await {
+                        Ok(positions) => positions,
+                        Err(err) => {
+                            log::warn!(
+                                "column {}: zone map {} could not be read ({err}); no zone map \
+                                 seed is written for it in this file",
+                                field.name,
+                                index.name
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
             zone_map_columns.entry(field_id).or_default().push((
@@ -235,9 +253,10 @@ async fn seed_writers_for(
             continue;
         };
         let positions = consumers.iter().any(|c| c.2);
-        if consumers
-            .iter()
-            .any(|c| c.1 != rows_per_zone || c.2 != positions)
+        if purpose == SeedWriterPurpose::Collect
+            && consumers
+                .iter()
+                .any(|c| c.1 != rows_per_zone || c.2 != positions)
         {
             log::info!(
                 "column {}: zone maps {:?} share one seed of {rows_per_zone} rows per record{}",
@@ -275,8 +294,8 @@ fn required_seed_feature_flags(writers: &[Box<dyn IndexSeedWriter>]) -> u64 {
 /// activates them in the next commit of any kind. Until then the write path
 /// embeds no such seed ([`SeedCollector::for_write`]), and afterwards the
 /// flags are sticky, so no manifest references a seed its flags do not
-/// announce. Nothing is read from data files; `dataset` only serves as the
-/// index store for details that are not inline.
+/// announce. Nothing is read from data files or index files; `dataset`
+/// only serves as the index store for details that are not inline.
 pub async fn apply_seed_feature_flags(
     manifest: &mut Manifest,
     indices: &[IndexMetadata],
@@ -285,7 +304,13 @@ pub async fn apply_seed_feature_flags(
     if indices.is_empty() {
         return Ok(());
     }
-    let writers = seed_writers_for(dataset, indices, &manifest.schema).await?;
+    let writers = seed_writers_for(
+        dataset,
+        indices,
+        &manifest.schema,
+        SeedWriterPurpose::FeatureFlags,
+    )
+    .await?;
     let required = required_seed_feature_flags(&writers);
     manifest.reader_feature_flags |= required;
     manifest.writer_feature_flags |= required;

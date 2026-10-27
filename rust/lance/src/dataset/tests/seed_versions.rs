@@ -943,11 +943,14 @@ async fn test_append_beside_unsupported_seed_version_writes_version_1() {
         relabel_version(&seed_bytes("val", crafted.column(0)), "2"),
     )];
     let mut beside = commit_crafted_fragment(dataset, crafted, &seeds).await;
+    // Both tables have written once (the process-wide null-position policy
+    // read is behind them) before the compared appends.
+    append(&mut beside, TRAINING_ROWS + ROWS_PER_FILE).await;
 
     plain.object_store.io_stats_incremental();
     beside.object_store.io_stats_incremental();
     append(&mut plain, TRAINING_ROWS + ROWS_PER_FILE).await;
-    append(&mut beside, TRAINING_ROWS + ROWS_PER_FILE).await;
+    append(&mut beside, TRAINING_ROWS + 2 * ROWS_PER_FILE).await;
     let plain_io = plain.object_store.io_stats_incremental();
     let beside_io = beside.object_store.io_stats_incremental();
     assert_eq!(
