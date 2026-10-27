@@ -196,9 +196,9 @@ pub fn apply_feature_flags(
     // `build_manifest` decides it from the index list it is committing and sets
     // the bit after calling this; without the carry the second call, from
     // `write_manifest_file`, would clear that decision immediately before the
-    // write.
-    let covered_index_metadata = (manifest.reader_feature_flags | manifest.writer_feature_flags)
-        & FLAG_COVERED_INDEX_METADATA;
+    // write. The same holds for local fragment addresses.
+    let index_list_flags = (manifest.reader_feature_flags | manifest.writer_feature_flags)
+        & (FLAG_COVERED_INDEX_METADATA | FLAG_LOCAL_FRAGMENT_ADDRESSES);
     let sticky_paired_flags = validated_sticky_paired_flags(manifest)?;
     let non_reusable_field_ids = manifest.max_allocated_field_id.is_some();
     if non_reusable_field_ids {
@@ -276,8 +276,8 @@ pub fn apply_feature_flags(
         manifest.writer_feature_flags |= FLAG_NON_REUSABLE_FIELD_IDS;
     }
 
-    manifest.reader_feature_flags |= covered_index_metadata;
-    manifest.writer_feature_flags |= covered_index_metadata;
+    manifest.reader_feature_flags |= index_list_flags;
+    manifest.writer_feature_flags |= index_list_flags;
     manifest.reader_feature_flags |= sticky_paired_flags;
     manifest.writer_feature_flags |= sticky_paired_flags;
 

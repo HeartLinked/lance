@@ -87,6 +87,7 @@ pub mod frag_reuse;
 pub mod frag_reuse_reader;
 mod frag_reuse_remapping;
 pub(crate) mod frag_reuse_with_stable_row_ids;
+pub(crate) mod local_fragment_addresses;
 pub mod mem_wal;
 pub mod optimize;
 pub mod prefilter;
@@ -4268,6 +4269,13 @@ impl Dataset {
         metrics: &dyn MetricsCollector,
     ) -> Result<Arc<dyn VectorIndex>> {
         let uuid = &index_meta.uuid;
+        // TODO: translate provisional fragment ids for vector segments too.
+        if !index_meta.fragment_id_map.is_empty() {
+            return Err(Error::not_supported(format!(
+                "vector segment {uuid} stores provisional fragment ids, which this build cannot \
+                 yet translate"
+            )));
+        }
         let object_store = self.object_store_for_index(index_meta).await?;
         let index_dir = self.indice_files_dir(index_meta)?;
         // Hold the shared allocation before cache accesses can evict it.

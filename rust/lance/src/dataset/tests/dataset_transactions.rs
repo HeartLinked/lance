@@ -4715,7 +4715,7 @@ mod staged_snapshot {
     use std::sync::Arc;
 
     use crate::Dataset;
-    use crate::dataset::{InsertBuilder, StagedSnapshot, WriteMode, WriteParams};
+    use crate::dataset::{InsertBuilder, StagedSnapshot, WriteParams};
     use crate::index::DatasetIndexExt;
     use arrow_array::{Int32Array, RecordBatch, UInt64Array};
     use arrow_schema::{DataType, Field, Schema};
@@ -4826,14 +4826,14 @@ mod staged_snapshot {
         assert_eq!(fragment_of(staged_hits[0]), provisional);
         assert!(staged_plan.contains("ScalarIndexQuery"), "{staged_plan}");
 
-        let racer = InsertBuilder::new(read.clone())
-            .with_params(&WriteParams {
-                mode: WriteMode::Append,
-                ..Default::default()
-            })
-            .execute(vec![batch(200..205)])
+        // A V2 racer: a named operation racing an action set fails closed.
+        let (racer, _) = StagedSnapshot::try_new_experimental(read.clone())
+            .await
+            .unwrap()
+            .append("racing append", vec![batch(200..205)])
             .await
             .unwrap();
+        let racer = racer.commit().await.unwrap();
         let racer_fragment = racer.fragments().last().unwrap().id as u32;
 
         let committed = snapshot.commit().await.unwrap();
