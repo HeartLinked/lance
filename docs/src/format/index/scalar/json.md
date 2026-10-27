@@ -22,7 +22,7 @@ The chosen type is recorded in the index details as `target_data_type`. It is
 carried the type, and for one whose type a later rewrite of the details could
 not recover.
 
-### Row Domain of the Target
+### Target Version
 
 Every index has a version is stored in the `IndexMetadata`. A JSON-wrapped
 target has no `IndexMetadata` entry of its own to record a version in, and
