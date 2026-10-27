@@ -24,47 +24,25 @@ not recover.
 
 ### Row Domain of the Target
 
-JSON-path indexes do not support an Inverted target (create an Inverted index
-directly on the JSON column instead), and a vector index is not a scalar-index
-plugin, so it can never be wrapped either. A JSON index can otherwise wrap any
-scalar target whose `basic_trainer` accepts the extracted Arrow type,
-including BTree, Bitmap, LabelList, ZoneMap, BloomFilter, FM, NGram, R-Tree,
-and MinHash LSH.
+Every index has a version is stored in the `IndexMetadata`. A JSON-wrapped
+target has no `IndexMetadata` entry of its own to record a version in, and
+most target types do not otherwise self-describe their version inside their
+own files (MinHash LSH, which stamps `minhash_lsh_index_version` into its
+own file metadata, is one exception). So the target's own version has to be
+recorded somewhere in `JsonIndexDetails` itself.  The field
+`target_index_version`, holds the version the target was actually built with
+-- the same number that would sit in `IndexMetadata::index_version` for a
+standalone instance of that type.
 
-Unlike a standalone index, a JSON-wrapped target has no `IndexMetadata` entry
-of its own to record a version in, and most target types do not otherwise
-self-describe their version inside their own files: BTree, for example, is
-simply told its domain by the version number its caller passes in, rather
-than reading it back from `page_lookup.lance` or `page_data.lance` (MinHash
-LSH, which stamps `minhash_lsh_index_version` into its own file metadata, is
-the one exception). So the target's own version has to be recorded somewhere
-in `JsonIndexDetails` itself: a new field, `target_index_version`, holds the
-version the target was actually built at -- the same number that would sit in
-`IndexMetadata::index_version` for a standalone instance of that type.
-`target_index_version` is absent on a JSON index built before this field
-existed; a reader then falls back to the legacy, per-target-type floor
-version it already applies today: the row-id-domain floor version for BTree,
-Bitmap, and LabelList (the only target types a pre-existing JSON index could
-have trained in the address domain without recording it), and the target
-plugin's one and only version for every other target type.
-
-`target_data_type` completes the description of the *extracted values*;
-`target_index_version` completes the description of the target index itself,
-so the two fields together make `JsonIndexDetails` a lossless description of
-which on-disk format the wrapped target uses. This also lifts the
-restriction under which a JSON-wrapped BTree, Bitmap, or LabelList target
-could not be created or optimized in the row-address domain on a
-stable-row-id dataset: once the version is recorded explicitly, there is
-nothing left to infer.
+If `target_index_version` is absent on a JSON index then we assume that
+index was built before this field existed.  Readers should use version 1
+for a label list index and version 0 for all other indexes.
 
 `target_index_version` does not affect `JSON_INDEX_VERSION` itself, which
 tracks the JSON wrapper's own on-disk format and is unrelated to the target's
 version; nor does it change how an old reader decides whether it can safely
 skip a JSON index whose target it does not understand. That decision is
-based on the target plugin's own declared maximum version, looked up by
-decoding `target_details`' `type_url`, exactly as query routing and
-`load_index` already do -- not on `JSON_INDEX_VERSION`, which says nothing
-about the target type and is unaffected by a target's own version changes.
+based on the target plugin's own declared maximum version.
 
 ## Index Details
 
