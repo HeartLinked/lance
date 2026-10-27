@@ -1447,8 +1447,10 @@ pub async fn merge_zonemap_indices(
 /// `remap_zone` copies a zone's counts into each destination run, which is
 /// exact only when the run keeps every row of the zone. A version 1 file
 /// must hold exact counts, so a narrower run is accepted only when the zone
-/// has no NaNs and its null count is exact (recomputed from a bitmap, or
-/// zero); otherwise the merge is refused before writing.
+/// has no NaNs and its null count is exact: recomputed from a bitmap, zero,
+/// or a zone whose every row is null, since every surviving row of it is a
+/// null too (`remap_zone` then counts the run's own length). Otherwise the
+/// merge is refused before writing.
 fn reject_inexact_remapped_zone(
     source: &ZoneMapStatistics,
     remapped: &ZoneMapStatistics,
@@ -1457,7 +1459,8 @@ fn reject_inexact_remapped_zone(
     if remapped.bound.length == source.bound.length {
         return Ok(());
     }
-    let nulls_exact = null_positions_exact || source.null_count == 0;
+    let all_null = source.null_count as usize == source.bound.length;
+    let nulls_exact = null_positions_exact || source.null_count == 0 || all_null;
     if source.nan_count == 0 && nulls_exact {
         return Ok(());
     }
@@ -9149,6 +9152,55 @@ mod tests {
         assert_eq!(merged.zones[0].null_count, 0);
         assert_eq!(merged.zones[0].nan_count, 0);
         assert_eq!(merged.zones[0].negative_nan_count, Some(0));
+
+        // An all-null zone narrowed without a bitmap: every surviving row is
+        // a null, so the run's count is its own length and the merge is
+        // persisted as version 1 rather than forced into a rebuild.
+        let tmpdir = TempObjDir::default();
+        let mut source =
+            train_float_index_in(local_store(&tmpdir), 3, vec![None, None, None]).await;
+        assert_eq!(source.zones[0].null_count, 3);
+        let source_mut = Arc::get_mut(&mut source).unwrap();
+        source_mut.null_rows = None;
+        source_mut.fri = Some(Arc::new(TestRemapper::new([
+            (1, new_row),
+            (2, new_row + 1),
+        ])));
+        let dest_tmpdir = TempObjDir::default();
+        let dest_store = local_store(&dest_tmpdir);
+        merge_zonemap_indices(
+            &[source.as_ref()],
+            dest_store.as_ref(),
+            &RoaringBitmap::from_iter([3]),
+        )
+        .await
+        .expect("a narrowed all-null zone keeps an exact null count");
+        let merged = ZoneMapIndex::load(
+            dest_store,
+            None,
+            &LanceCache::no_cache(),
+            false,
+            ZoneMapIndexVersion::V1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged.zones.len(), 1);
+        assert_eq!(merged.zones[0].bound.length, 2);
+        assert_eq!(
+            merged.zones[0].null_count, 2,
+            "the run's null count is its own length"
+        );
+        assert_eq!(merged.zones[0].nan_count, 0);
+        assert_eq!(merged.zones[0].negative_nan_count, Some(0));
+        assert!(merged.zones[0].min.is_null() && merged.zones[0].max.is_null());
+        assert_eq!(
+            merged
+                .search(&SargableQuery::IsNull(), &NoOpMetricsCollector)
+                .await
+                .unwrap(),
+            SearchResult::at_most(RowAddrTreeMap::from_iter(new_row..new_row + 2)),
+            "the narrowed zone still answers IS NULL for its rows"
+        );
 
         // A run that keeps every row of its zone keeps exact counts.
         let tmpdir = TempObjDir::default();
