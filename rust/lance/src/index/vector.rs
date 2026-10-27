@@ -742,6 +742,12 @@ async fn prepare_vector_segment_build(
         )));
     };
 
+    if ivf_params0.target_partition_size == Some(0) {
+        return Err(Error::invalid_input(
+            "target_partition_size must be greater than zero",
+        ));
+    }
+
     if require_precomputed_ivf && ivf_params0.centroids.is_none() {
         return Err(Error::index(format!(
             "{mode}: missing precomputed IVF centroids; please provide \
