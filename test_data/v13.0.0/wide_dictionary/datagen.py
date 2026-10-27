@@ -41,10 +41,15 @@ dataset = lance.write_dataset(
 )
 dataset.optimize.compact_files()
 
-for name in ["merged_chunks.lance", "compacted.lance"]:
+
+def assert_read_fails(path: Path) -> None:
     try:
-        lance.dataset(base / name).to_table()
+        lance.dataset(path).to_table()
     except pa.ArrowInvalid as error:
         assert "dictionary indices use 32 bits" in str(error)
     else:
-        raise AssertionError(f"{name} must reproduce the widened-index read failure")
+        raise AssertionError(f"{path} must reproduce the widened-index read failure")
+
+
+for name in ["merged_chunks.lance", "compacted.lance"]:
+    assert_read_fails(base / name)
