@@ -426,7 +426,7 @@ are rebaseable conflicts with Update:
 ### UpdateConfig
 
 Modifies table configuration, table metadata, schema metadata, or field metadata without changing data.
-It can also allocate [clustering definitions](clustering.md#allocating-definitions): each new definition
+It can also allocate clustering definitions: each new definition
 carries the id the writer derived from `Manifest.max_clustering_id`, the commit verifies the ids are the
 next ones in order, appends the definitions and raises the mark in the same version as the metadata updates.
 
