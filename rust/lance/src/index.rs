@@ -1120,6 +1120,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         }
         .validate_covering_fields()?;
         if segment.fields() != expected_fields.as_slice()
@@ -1180,6 +1181,7 @@ pub(crate) async fn build_index_metadata_from_segments(
                 created_at: Some(chrono::Utc::now()),
                 base_id: None,
                 files: None,
+                fragment_id_map: Default::default(),
             };
             crate::index::scalar::inverted::finalize_segment_files_if_needed(dataset, &metadata)
                 .await?;
@@ -1201,6 +1203,7 @@ pub(crate) async fn build_index_metadata_from_segments(
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: Some(files),
+            fragment_id_map: Default::default(),
         })
     }))
     .buffered(dataset.object_store.io_parallelism())
@@ -5303,6 +5306,7 @@ mod tests {
                 size_bytes: payload.len() as u64,
                 file_metadata_size_bytes: None,
             }]),
+            fragment_id_map: Default::default(),
         }
     }
 
@@ -5881,6 +5885,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         // The shape every merge_segments impl builds: keyed field only, carried
@@ -9480,6 +9485,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -9521,6 +9527,7 @@ mod tests {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
 
         let desc = IndexDescriptionImpl::try_new(vec![metadata], &dataset)
@@ -12482,6 +12489,7 @@ mod tests {
             created_at: Some(chrono::Utc::now()),
             base_id: None,
             files: seg0.files.clone(),
+            fragment_id_map: Default::default(),
         };
 
         let err = dataset

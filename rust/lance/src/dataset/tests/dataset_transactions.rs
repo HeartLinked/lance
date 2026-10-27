@@ -2044,6 +2044,7 @@ async fn test_create_index_rejects_non_suffix_covering_fields() {
         created_at: None,
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     };
 
     let transaction = Transaction::new(
@@ -2105,6 +2106,7 @@ async fn test_shallow_clone_preserves_the_covering_fence() {
         created_at: None,
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     };
     dataset
         .apply_commit(
@@ -2201,6 +2203,7 @@ async fn test_covering_commit_fences_the_table_with_a_feature_flag() {
         created_at: None,
         base_id: None,
         files: None,
+        fragment_id_map: Default::default(),
     };
     let uuid = index.uuid;
 
@@ -2460,6 +2463,7 @@ mod composite {
             created_at: None,
             base_id: None,
             files: None,
+            fragment_id_map: Default::default(),
         };
         dataset
             .apply_commit(
@@ -3600,6 +3604,7 @@ mod composite {
             created_at: None,
             dataset_version: None,
             data_change: false,
+            local_fragment_addresses: false,
         }
     }
 
@@ -3980,6 +3985,7 @@ mod composite {
             created_at: metadata.created_at,
             dataset_version: Some(metadata.dataset_version),
             data_change: false,
+            local_fragment_addresses: false,
         })
     }
 
