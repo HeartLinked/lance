@@ -5401,7 +5401,7 @@ impl Scanner {
         // retain their existing scoring and approximation contracts.
         if let FtsQuery::Match(match_query) = query
             && let Some(plan) = self
-                .plan_restricted_match_query(match_query, &params, filter_plan, &prefilter_source)
+                .plan_corpus_match_query(match_query, &params, filter_plan, &prefilter_source)
                 .await?
         {
             return Ok(plan);
@@ -6058,9 +6058,9 @@ impl Scanner {
     }
 
     /// Use global append-only corpus statistics independently of the selected candidates.
-    /// This entry is called only for a root scalar-text Match with a user prefilter or
-    /// explicit fragment selection. Other query shapes retain their existing planner.
-    async fn plan_restricted_match_query(
+    /// Exact root scalar-text matches share this corpus with and without candidate
+    /// restrictions. Other query shapes retain their existing planner.
+    async fn plan_corpus_match_query(
         &self,
         query: &MatchQuery,
         params: &FtsSearchParams,
@@ -6070,13 +6070,8 @@ impl Scanner {
         let is_primary_fts = self.full_text_query.is_some()
             && self.nearest.is_none()
             && self.filter.query_filter.is_none();
-        let has_postfilter = !self.prefilter && self.filter.expr_filter.is_some();
-        let has_restriction =
-            self.fragments.is_some() || (self.prefilter && !filter_plan.is_empty());
         if !is_primary_fts
             || self.fast_search
-            || has_postfilter
-            || !has_restriction
             || params.wand_factor != 1.0
             || params.phrase_slop.is_some()
             || query.fuzziness != Some(0)
@@ -6542,6 +6537,14 @@ impl Scanner {
             ))));
         }
 
+        // Candidate fragments do not define the corpus: even an index-only
+        // selection needs statistics from unindexed rows outside that selection.
+        let corpus_fragments = if self.fast_search {
+            target_fragments
+        } else {
+            self.dataset.fragments()
+        };
+
         // Kept per column; see `FlatStatsCoverage`.
         let mut per_column_coverage = Vec::with_capacity(query.column_names().len());
         let mut uncovered = RoaringBitmap::new();
@@ -6570,7 +6573,7 @@ impl Scanner {
                         .collect()
                 }
                 // No index on this column at all, so no fragment is covered for it.
-                None => target_fragments
+                None => corpus_fragments
                     .iter()
                     .map(|fragment| fragment.id as u32)
                     .collect(),
@@ -6584,7 +6587,7 @@ impl Scanner {
             // reaches `docFreq_f`.
             let mut column_stale_rows = RowAddrTreeMap::new();
             match self
-                .fts_overlay_plan(column, DocumentGranularity::Row, target_fragments)
+                .fts_overlay_plan(column, DocumentGranularity::Row, corpus_fragments)
                 .await?
             {
                 FtsOverlayPlan::Unchanged(_) => {}
@@ -6597,7 +6600,7 @@ impl Scanner {
                 // A legacy segment reports no fragment coverage, so no target fragment
                 // can be proven free of stale entries and no row can be named as one.
                 FtsOverlayPlan::FullScan => {
-                    uncovered.extend(target_fragments.iter().map(|fragment| fragment.id as u32));
+                    uncovered.extend(corpus_fragments.iter().map(|fragment| fragment.id as u32));
                     needs_whole_corpus = true;
                 }
             }
@@ -6624,7 +6627,7 @@ impl Scanner {
         stale_addresses.retain(|fragment_id, _| !uncovered.contains(*fragment_id));
         let overlay_block = self.stale_rows_block_mask(&stale_addresses).await?;
 
-        let uncovered_fragments: Vec<Fragment> = target_fragments
+        let uncovered_fragments: Vec<Fragment> = corpus_fragments
             .iter()
             .filter(|fragment| uncovered.contains(fragment.id as u32))
             .cloned()
@@ -6696,7 +6699,7 @@ impl Scanner {
         // index and the corpus has to be re-measured from every target fragment. That
         // is a full scan, so it stays confined to that case.
         let (flat_fragments, stats_scope) = if needs_whole_corpus {
-            (target_fragments.to_vec(), FlatStatsScope::WholeCorpus)
+            (corpus_fragments.to_vec(), FlatStatsScope::WholeCorpus)
         } else {
             (
                 uncovered_fragments,
@@ -6724,7 +6727,7 @@ impl Scanner {
             .await?;
         // Only a plan with both children needs the two to agree on a corpus, and a
         // whole-corpus scan leaves no fragment for an indexed child.
-        let is_mixed = !needs_whole_corpus && flat_fragments.len() != target_fragments.len();
+        let is_mixed = !needs_whole_corpus && !covered.is_empty();
         let shared_scorer = is_mixed.then(|| Arc::new(SharedFtsScorer::new()));
         let flat_plan = self
             .plan_flat_combined_fields_query(
@@ -6743,20 +6746,26 @@ impl Scanner {
         let scored_plan = if !is_mixed {
             flat_plan
         } else {
-            let union =
-                UnionExec::try_new(vec![index_exec(Some(covered), shared_scorer), flat_plan])?;
+            let union = UnionExec::try_new(vec![
+                index_exec(Some(covered), shared_scorer.clone()),
+                flat_plan,
+            ])?;
             Arc::new(RepartitionExec::try_new(
                 union,
                 Partitioning::RoundRobinBatch(1),
             )?)
         };
-        Ok(Arc::new(
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
             SortExec::new(
                 Self::fts_score_sort_exprs(scored_plan.schema().as_ref())?.into(),
                 scored_plan,
             )
             .with_fetch(params.limit),
-        ))
+        );
+        Ok(match shared_scorer {
+            Some(shared_scorer) => Arc::new(SharedFtsScorerExec::new_combined(plan, shared_scorer)),
+            None => plan,
+        })
     }
 
     /// Plan the flat (unindexed) side of a `combined_fields` query: one scan over
