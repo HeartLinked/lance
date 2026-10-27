@@ -5947,7 +5947,7 @@ impl PySearchFilter {
             k,
             minimum_nprobes,
             maximum_nprobes,
-            metric_type_opt,
+            metric_type,
             refine_factor,
             use_index,
             ef,
@@ -5955,8 +5955,6 @@ impl PySearchFilter {
             approx_mode,
             search_effort,
         ) = vector_query_params_from_dict(query, default_k)?;
-
-        let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
 
         let vector_query = VectorQuery {
             column,
