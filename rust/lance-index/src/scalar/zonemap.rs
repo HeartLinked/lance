@@ -35,8 +35,8 @@ use arrow_array::{
     ArrayRef, RecordBatch, UInt32Array, UInt64Array, new_empty_array, new_null_array,
 };
 use arrow_schema::{DataType, Field};
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion_common::ScalarValue;
+use datafusion_execution::SendableRecordBatchStream;
 use lance_select::{RowAddrTreeMap, RowSetOps};
 use std::{collections::HashMap, sync::Arc};
 
@@ -3541,16 +3541,16 @@ mod tests {
         Array, Float64Array, PrimitiveArray, RecordBatch, UInt32Array, UInt64Array, record_batch,
     };
     use arrow_schema::{DataType, Field, Schema};
-    use datafusion::execution::SendableRecordBatchStream;
-    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion_common::ScalarValue;
+    use datafusion_execution::SendableRecordBatchStream;
+    use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
     use futures::{StreamExt, TryStreamExt, stream};
     use lance_core::utils::tempfile::TempObjDir;
     use lance_core::{
         ROW_ADDR,
         cache::{LanceCache, WeakLanceCache},
     };
-    use lance_datafusion::datagen::DatafusionDatagenExt;
+    use lance_datafusion_exec::datagen::DatafusionDatagenExt;
     use lance_datagen::ArrayGeneratorExt;
     use lance_datagen::{BatchCount, RowCount, array};
     use lance_io::object_store::ObjectStore;
@@ -4118,6 +4118,17 @@ mod tests {
         );
     }
 
+    /// Indices that do not override `lookup` refuse it rather than returning
+    /// no matches, so callers can fall back to another plan.
+    #[tokio::test]
+    async fn test_lookup_is_not_supported() {
+        let index =
+            train_and_load::<arrow_array::types::Int32Type>(vec![vec![Some(1), Some(2)]]).await;
+        let keys = Arc::new(arrow_array::Int32Array::from(vec![1]));
+        let err = index.lookup(keys, &NoOpMetricsCollector).err().unwrap();
+        assert!(matches!(err, Error::NotSupported { .. }), "{err}");
+    }
+
     #[tokio::test]
     async fn test_empty_zonemap_index() {
         let tmpdir = TempObjDir::default();
@@ -4480,6 +4491,23 @@ mod tests {
         let mut expected = RowAddrTreeMap::new();
         expected.insert_range(0..500); // All rows since NaN is in every zone
         assert_eq!(result, SearchResult::at_most(expected));
+
+        // The planner uses this raw total-order range to retrieve negative
+        // NaNs, which sort below negative infinity. Version 1 records the NaN
+        // sign split, so a zone whose NaNs are all positive is pruned here;
+        // version 0 has no split to consult and keeps every NaN-bearing zone
+        // as a candidate. Every NaN in this data is positive.
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float32(Some(f32::NEG_INFINITY))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::new()),
+            "version 1 knows every NaN here is positive, so no zone can hold \
+             a value below negative infinity"
+        );
 
         // Test search for a specific finite value that exists in the data
         let query = SargableQuery::Equals(ScalarValue::Float32(Some(5.0)));
@@ -9060,6 +9088,86 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// The planner rewrites an ordered float comparison into a total-order
+    /// range plus `OR other < -inf`, which exists only to retrieve negative
+    /// NaNs. Pruning that range must never drop a zone that really holds one:
+    /// the rows would be missing from the answer. Version 1 records the NaN
+    /// sign split, so it may prune only the zones whose NaNs are all positive.
+    #[tokio::test]
+    async fn test_negative_nan_range_keeps_zones_holding_negative_nans() {
+        // Zone 0: a negative NaN among finite values. Zone 1: positive NaNs
+        // only. Zone 2: finite only.
+        let tmpdir = TempObjDir::default();
+        let index = train_float_index_in(
+            local_store(&tmpdir),
+            3,
+            vec![
+                Some(-f64::NAN),
+                Some(1.0),
+                Some(2.0),
+                Some(f64::NAN),
+                Some(f64::NAN),
+                Some(3.0),
+                Some(4.0),
+                Some(5.0),
+                Some(6.0),
+            ],
+        )
+        .await;
+        assert_eq!(index.zones.len(), 3);
+        assert_eq!(index.zones[0].negative_nan_count, Some(1));
+        assert_eq!(index.zones[1].negative_nan_count, Some(0));
+        assert_eq!(index.zones[2].nan_count, 0);
+
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float64(Some(f64::NEG_INFINITY))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter(0..3)),
+            "only the zone holding a negative NaN may survive, and it must"
+        );
+    }
+
+    /// Version 0 has no NaN sign split to consult, so the same range must keep
+    /// every NaN-bearing zone as a candidate even when all of its NaNs are in
+    /// fact positive. Pruning it there would drop rows the planner asked for.
+    #[tokio::test]
+    async fn test_negative_nan_range_is_conservative_in_version_0() {
+        let tmpdir = TempObjDir::default();
+        let mut index = train_float_index_in(
+            local_store(&tmpdir),
+            3,
+            vec![
+                Some(f64::NAN),
+                Some(1.0),
+                Some(2.0),
+                Some(3.0),
+                Some(4.0),
+                Some(5.0),
+            ],
+        )
+        .await;
+        let index_mut = Arc::get_mut(&mut index).unwrap();
+        index_mut.version = ZoneMapIndexVersion::V0;
+        for zone in index_mut.zones.iter_mut() {
+            zone.negative_nan_count = None;
+        }
+
+        let query = SargableQuery::Range(
+            Bound::Unbounded,
+            Bound::Excluded(ScalarValue::Float64(Some(f64::NEG_INFINITY))),
+        );
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        assert_eq!(
+            result,
+            SearchResult::at_most(RowAddrTreeMap::from_iter(0..3)),
+            "without a sign split the NaN-bearing zone stays a candidate"
+        );
     }
 
     /// Remapping copies a zone's counts into each destination run. A version
