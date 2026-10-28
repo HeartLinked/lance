@@ -4823,6 +4823,45 @@ fn test_reuse_places_whole_records_into_their_target_zone() {
     assert_eq!(outcome, SeedOutcome::Rejected);
 }
 
+/// A narrow column's partial reuse is capped: once more than half of a
+/// fragment's rows sit in records that cross a target boundary, the fragment
+/// is scanned whole instead of in scattered intervals. A wide column keeps
+/// partial reuse at any fraction.
+#[test]
+fn test_reuse_caps_rescan_for_narrow_columns() {
+    // Ten rows in records of three: [0,3) [3,6) [6,9) [9,10).
+    let seed = seed_of(7, 3, int_values(10, 0));
+
+    // Target 4: [3,6) crosses 4 and [6,9) crosses 8, six of ten rows.
+    let mut reused = ReusedZones::new(false);
+    let outcome = reused
+        .reuse(&harvested(seed.clone(), 10), 4, &DataType::Int32, true)
+        .unwrap();
+    assert_eq!(outcome, SeedOutcome::Rejected);
+    assert!(reused.zones.is_empty());
+    assert_eq!(reused.rejected_fragments, vec![7]);
+
+    // Target 5: only [3,6) crosses, three of ten rows.
+    let mut reused = ReusedZones::new(false);
+    let outcome = reused
+        .reuse(&harvested(seed, 10), 5, &DataType::Int32, true)
+        .unwrap();
+    assert_eq!(outcome, SeedOutcome::Partial(vec![3..6]));
+    assert_eq!(reused.partial_fragments, vec![7]);
+
+    // The same six of ten rows on a string column stay partial.
+    let seed = seed_of(
+        7,
+        3,
+        arrow_array::StringArray::from_iter_values((0..10).map(|i| format!("v{i:02}"))),
+    );
+    let mut reused = ReusedZones::new(false);
+    let outcome = reused
+        .reuse(&harvested(seed, 10), 4, &DataType::Utf8, true)
+        .unwrap();
+    assert_eq!(outcome, SeedOutcome::Partial(vec![3..6, 6..9]));
+}
+
 /// Non-divisible sizes: the boundary phase advances by `T mod s` per
 /// zone, so the crossing record and the number of whole records per
 /// zone change from zone to zone. Checked against a brute-force

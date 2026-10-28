@@ -445,7 +445,8 @@ fn crossing_rows(rows: u64, s: u64, t: u64) -> u64 {
 #[case::divisible(64, 320, true)]
 #[case::whole_fragment(64, 20000, true)]
 #[case::whole_fragment_no_bitmap(64, 20000, false)]
-#[case::non_divisible(64, 100, true)]
+#[case::non_divisible_capped(64, 100, true)]
+#[case::non_divisible_partial(64, 160, false)]
 #[case::phase_shifting(64, 10000, false)]
 #[case::same_size(64, 64, true)]
 #[tokio::test]
@@ -483,14 +484,22 @@ async fn test_create_index_keeps_configured_boundaries(
 
     // The report matches the interval arithmetic: fragment 0 (no seed) is
     // scanned whole, the others reuse whole records and scan crossings.
+    // `val` is a narrow column: past half its rows in crossing records a
+    // fragment is scanned whole rather than in scattered intervals.
     let report = &reports[0];
     let crossing = crossing_rows(N as u64, s, t);
-    assert_eq!(report.scanned_rows, N as u64 + 5 * crossing, "{s} -> {t}");
-    if crossing == 0 {
+    let rescanned = if crossing * 2 > N as u64 {
+        N as u64
+    } else {
+        crossing
+    };
+    assert_eq!(report.scanned_rows, N as u64 + 5 * rescanned, "{s} -> {t}");
+    if rescanned == 0 {
         assert_eq!(report.reused_fragments, vec![1, 2, 3, 4, 5]);
         assert_eq!(report.scanned_fragments, vec![0]);
-    } else if crossing == N as u64 {
+    } else if rescanned == N as u64 {
         assert!(report.reused_fragments.is_empty());
+        assert!(report.partial_fragments.is_empty());
         assert_eq!(report.scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
     } else {
         assert_eq!(report.partial_fragments, vec![1, 2, 3, 4, 5]);
@@ -517,12 +526,12 @@ async fn test_create_index_keeps_configured_boundaries(
     for ((fragment, pages), (_, full)) in seeded_pages.iter().zip(&control_pages) {
         if *fragment == 0 {
             assert!(*pages > 4096, "fragment 0 scanned: {pages}");
-        } else if crossing == 0 {
+        } else if rescanned == 0 {
             assert!(
                 *pages < 4096,
                 "fragment {fragment} reused but read {pages} page bytes"
             );
-        } else if crossing < N as u64 {
+        } else if rescanned < N as u64 {
             assert!(
                 *pages < *full,
                 "fragment {fragment}: partial {pages} vs full {full}"
@@ -574,13 +583,14 @@ async fn test_fragment_smaller_than_target_and_seed_larger_than_target() {
     .await;
     // Seed records larger than the target: no full record fits a zone. The
     // short tail record [19968, 20000) of each seeded fragment is the one
-    // exception (32 rows, exactly zone 624), so those fragments are partial
-    // with all other rows scanned.
+    // exception (32 rows, exactly zone 624); keeping it would leave all
+    // other rows of a narrow column to a scattered scan, so the fragments
+    // are scanned whole.
     assert!(reports[0].reused_fragments.is_empty());
-    assert_eq!(reports[0].partial_fragments, vec![1, 2]);
+    assert!(reports[0].partial_fragments.is_empty());
     assert_eq!(reports[0].scanned_fragments, vec![0, 1, 2]);
-    assert_eq!(reports[0].scanned_rows, 3 * N as u64 - 2 * 32);
-    assert_eq!(reports[0].reused_records, 2);
+    assert_eq!(reports[0].scanned_rows, 3 * N as u64);
+    assert_eq!(reports[0].reused_records, 0);
     assert_eq!(
         layout(&zone_summaries(&dataset, "val").await),
         (0..3u64)
@@ -697,8 +707,9 @@ async fn test_mixed_assembly_masks_partial_intervals_and_whole_fragments() {
     create_index(&mut dataset, "val", &zone_map_params(640, true, true), None).await; // seeds 640
     append(&mut dataset, 3 * N..4 * N).await; // 640-row seed
     dataset.drop_index(&index_name("val")).await.unwrap();
-    // Target 1000: fragment 1 (64-row records) is partial, fragment 2 has no
-    // seed, fragment 3 (640-row records) is partial too, fragment 0 has no seed.
+    // Target 1000: fragment 1 (64-row records) is partial; fragments 0 and
+    // 2 have no seed; fragment 3 (640-row records) would rescan 60 percent
+    // of a narrow column in scattered intervals and is scanned whole.
     let (_, reports) = with_reports(create_index(
         &mut dataset,
         "val",
@@ -706,12 +717,13 @@ async fn test_mixed_assembly_masks_partial_intervals_and_whole_fragments() {
         None,
     ))
     .await;
-    assert_eq!(reports[0].partial_fragments, vec![1, 3]);
+    assert!(crossing_rows(N as u64, 640, 1000) * 2 > N as u64);
+    assert_eq!(reports[0].partial_fragments, vec![1]);
     assert_eq!(reports[0].scanned_fragments, vec![0, 1, 2, 3]);
     assert!(reports[0].masked);
     assert_eq!(
         reports[0].scanned_rows,
-        2 * N as u64 + crossing_rows(N as u64, 64, 1000) + crossing_rows(N as u64, 640, 1000)
+        3 * N as u64 + crossing_rows(N as u64, 64, 1000)
     );
     let control_dir = TempStrDir::default();
     let mut control = unseeded_dataset(control_dir.as_str(), 3).await;

@@ -1926,6 +1926,32 @@ fn make_zone_map_index_details(
 /// arbitrarily wide — and fixed-width types wider than 8 bytes (e.g.
 /// Decimal128, FixedSizeBinary tensors). Fixed-width types ≤ 8 bytes (Int64,
 /// Float64, …) scan fast enough that the seed overhead is not worth it.
+/// Partial reuse of a fragment whose seed records cross target zone
+/// boundaries leaves one scattered interval per crossing record to the
+/// scan. On object stores each interval is at least one request, and for a
+/// narrow column those requests are small: measured against a sequential
+/// scan of the whole fragment, reusing the seed stops paying for itself
+/// once about half the rows are rescanned anyway. Wide columns save enough
+/// bytes per interval to keep partial reuse at any fraction.
+const NARROW_PARTIAL_REUSE_MAX_RESCAN_PERCENT: u64 = 50;
+
+/// Whether scanning only `uncovered_rows` of a fragment of `physical_rows`
+/// in scattered intervals beats scanning the fragment whole.
+fn partial_reuse_pays_off(data_type: &DataType, uncovered_rows: u64, physical_rows: u64) -> bool {
+    if !is_narrow_column(data_type) {
+        return true;
+    }
+    uncovered_rows.saturating_mul(100)
+        <= physical_rows.saturating_mul(NARROW_PARTIAL_REUSE_MAX_RESCAN_PERCENT)
+}
+
+/// Fixed-width values of at most 8 bytes: the column types whose scan is
+/// cheap enough that seeds are not requested by default and whose partial
+/// reuse is bounded by [`NARROW_PARTIAL_REUSE_MAX_RESCAN_PERCENT`].
+fn is_narrow_column(data_type: &DataType) -> bool {
+    !default_use_seeds(data_type)
+}
+
 fn default_use_seeds(data_type: &DataType) -> bool {
     match data_type {
         // Variable-length: width is unbounded, skipping scans is always valuable.
@@ -2737,9 +2763,22 @@ impl ReusedZones {
             return Ok(SeedOutcome::Rejected);
         };
         let placement = place_records(&validated.records, rows_per_zone, harvested.physical_rows);
-        if placement.fitted.is_empty() || (!placement.uncovered.is_empty() && !allow_partial) {
+        if placement.fitted.is_empty() {
             self.rejected_fragments.push(fragment_id);
             return Ok(SeedOutcome::Rejected);
+        }
+        if !placement.uncovered.is_empty() {
+            let uncovered_rows: u64 = placement
+                .uncovered
+                .iter()
+                .map(|interval| interval.end - interval.start)
+                .sum();
+            if !allow_partial
+                || !partial_reuse_pays_off(data_type, uncovered_rows, harvested.physical_rows)
+            {
+                self.rejected_fragments.push(fragment_id);
+                return Ok(SeedOutcome::Rejected);
+            }
         }
         for (zone_index, record) in placement.fitted {
             let target = self
