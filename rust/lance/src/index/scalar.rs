@@ -488,12 +488,23 @@ pub(super) async fn build_scalar_index(
         let zone_map_params = serde_json::from_str::<ZoneMapIndexBuilderParams>(
             params.params.as_deref().unwrap_or("{}"),
         )?;
+        // The zones hold what the scan yields: a blob column arrives as its
+        // descriptor, not as the schema's binary type.
+        let value_type = dataset
+            .schema()
+            .field(column)
+            .map(|field| {
+                lance_core::datatypes::BlobHandling::default()
+                    .unload_if_needed(field.clone())
+                    .data_type()
+            })
+            .unwrap_or_else(|| field.data_type().clone());
         progress.stage_start("load_data", None, "rows").await?;
         let created = zonemap::build_segment_with_seeds(
             dataset,
             column,
             zone_map_params,
-            field.data_type(),
+            &value_type,
             fragment_ids,
             training_request.criteria(),
             &index_store,

@@ -316,6 +316,79 @@ async fn test_zone_map_seed_harvest_after_column_name_swap() {
     assert_eq!(indexed.try_into_batch().await.unwrap().num_rows(), expected);
 }
 
+/// A zone map on a blob column itself is built from what the scan yields
+/// (the blob descriptor), on creation and on a later update.
+#[tokio::test]
+async fn test_zone_map_on_blob_column() {
+    let dir = TempStrDir::default();
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Int32, false),
+        blob_field("blob", true),
+    ]));
+    let make_batch = |start: i32| {
+        let mut blobs = BlobArrayBuilder::new(10);
+        for i in 0..10 {
+            if i % 3 == 0 {
+                blobs.push_null().unwrap();
+            } else {
+                blobs.push_bytes(b"blob").unwrap();
+            }
+        }
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from_iter_values(start..start + 10)),
+                blobs.finish().unwrap(),
+            ],
+        )
+        .unwrap()
+    };
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(make_batch(0))], schema.clone()),
+        dir.as_str(),
+        Some(WriteParams {
+            data_storage_version: Some(LanceFileVersion::V2_2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["blob"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(true),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(RecordBatchIterator::new([Ok(make_batch(10))], schema), None)
+        .await
+        .unwrap();
+    dataset
+        .optimize_indices(&OptimizeOptions::default())
+        .await
+        .unwrap();
+    for filter in ["blob IS NULL", "blob IS NOT NULL"] {
+        let mut flat = dataset.scan();
+        flat.use_scalar_index(false)
+            .project(&["id"])
+            .unwrap()
+            .filter(filter)
+            .unwrap();
+        let expected = flat.try_into_batch().await.unwrap().num_rows();
+        let mut indexed = dataset.scan();
+        indexed.project(&["id"]).unwrap().filter(filter).unwrap();
+        assert_eq!(
+            indexed.try_into_batch().await.unwrap().num_rows(),
+            expected,
+            "{filter}"
+        );
+    }
+}
+
 #[rstest::rstest]
 #[case::blob_first(true, false)]
 #[case::blob_last(false, false)]

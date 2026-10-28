@@ -506,6 +506,7 @@ async fn test_create_index_keeps_configured_boundaries(
         assert_eq!(report.scanned_fragments, vec![0, 1, 2, 3, 4, 5]);
     }
     assert!(report.masked);
+    assert_eq!(report.scans, 1, "six fragments fit one scan batch");
     // Seeds are read through a bounded window and dropped once folded: the
     // raw bytes held at once never exceed that many seeds, and the window
     // is never wider than the configured harvest concurrency.
@@ -836,6 +837,32 @@ async fn test_zero_rows_per_zone_is_rejected_without_a_scan() {
     .unwrap_err();
     assert!(err.to_string().contains("rows_per_zone"), "{err}");
     assert!(index_metadata(&dataset, "val").await.is_empty());
+}
+
+/// Fragments with rows left to read are scanned in batches as they are
+/// decided, not one scan per fragment and not one scan after the last
+/// decision: 33 seedless fragments take three scans of at most 16.
+#[tokio::test]
+async fn test_scans_are_batched_by_decided_fragments() {
+    let dir = TempStrDir::default();
+    let mut dataset = unseeded_dataset(dir.as_str(), 32).await;
+    let (_, reports) = with_reports(create_index(
+        &mut dataset,
+        "val",
+        &zone_map_params(1000, true, false),
+        None,
+    ))
+    .await;
+    let report = &reports[0];
+    assert_eq!(report.scanned_fragments.len(), 33);
+    assert_eq!(report.scans, 3);
+    assert_eq!(
+        layout(&zone_summaries(&dataset, "val").await),
+        (0..33u64)
+            .flat_map(|f| target_layout(f, N as u64, 1000))
+            .collect::<Vec<_>>()
+    );
+    assert_index_matches_scan_with(&dataset, VAL_FILTERS, false).await;
 }
 
 /// Legacy (V1) storage cannot take a physical mask: seeded fragments are
@@ -1807,6 +1834,7 @@ async fn test_harvest_reads_are_bounded_and_concurrent() {
         "every fragment is folded from its seed, so no scan read is counted"
     );
     assert_eq!(report.scanned_rows, 0);
+    assert_eq!(report.scans, 0, "nothing left to scan, no scan issued");
     let per_seed = report.total_seed_bytes / seeded.len();
     assert!(
         report.max_live_seed_bytes <= per_seed,

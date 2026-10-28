@@ -123,6 +123,8 @@ pub struct SeedReuseReport {
     pub scanned_fragments: Vec<u64>,
     /// Physical rows selected for the scan (whole fragments plus intervals).
     pub scanned_rows: u64,
+    /// Scans issued: batches of decided fragments with rows left to read.
+    pub scans: usize,
     /// Most raw seed bytes owned by the build at any one moment (live
     /// ownership, decremented when a fragment's buffer is dropped).
     pub max_live_seed_bytes: usize,
@@ -202,9 +204,14 @@ impl Drop for InFlightHarvest<'_> {
     }
 }
 
-/// Most fragments scanned at once by [`assemble_segment`]. Each scan reads
-/// at the store's parallelism, so a few in flight saturate it.
-const ZONEMAP_SCAN_CONCURRENCY_CAP: usize = 4;
+/// Decided fragments per scan in [`assemble_segment`]. One scanner
+/// pipelines its fragments' reads and is planned once, so fragments are
+/// scanned in batches of this many rather than one scanner per fragment.
+const ZONEMAP_SCAN_BATCH_FRAGMENTS: usize = 16;
+
+/// Most batches scanned at once. Each scan already reads at the store's
+/// parallelism; a second one in flight only covers the gap between batches.
+const ZONEMAP_SCAN_CONCURRENCY_CAP: usize = 2;
 
 fn scan_concurrency(dataset: &Dataset) -> usize {
     (dataset.object_store.io_parallelism() / 16).clamp(1, ZONEMAP_SCAN_CONCURRENCY_CAP)
@@ -232,9 +239,9 @@ struct FragmentPlan<'a> {
     seed_bytes: usize,
 }
 
-/// A fragment's plan with the zone pieces its scan produced.
-struct FragmentResult<'a> {
-    plan: FragmentPlan<'a>,
+/// A batch of decided fragments with the zone pieces their scan produced.
+struct BatchResult<'a> {
+    plans: Vec<FragmentPlan<'a>>,
     scanned: Option<ScannedZones>,
 }
 
@@ -306,49 +313,68 @@ fn plan_fragment<'a>(
     .boxed()
 }
 
-/// Read the rows `plan` left to the scan and cut them into this fragment's
-/// target zones.
-fn scan_fragment<'a>(
+/// Read, in one scan, the rows the `plans` of a batch left to it and cut
+/// them into their fragments' target zones. Whole fragments and interval
+/// fragments share the scan through one physical mask; a batch with
+/// nothing to scan reads nothing.
+fn scan_batch<'a>(
     dataset: &'a Dataset,
     column: &'a str,
     criteria: &'a TrainingCriteria,
     data_type: &'a DataType,
     rows_per_zone: u64,
     keep_positions: bool,
-    plan: Result<FragmentPlan<'a>>,
-) -> BoxFuture<'a, Result<FragmentResult<'a>>> {
+    plans: Result<Vec<FragmentPlan<'a>>>,
+) -> BoxFuture<'a, Result<BatchResult<'a>>> {
     async move {
-        let plan = plan?;
-        let mask = match &plan.scan {
-            FragmentScan::None => {
-                return Ok(FragmentResult {
-                    plan,
-                    scanned: None,
-                });
+        let plans = plans?;
+        let mut fragments = Vec::new();
+        let mut physical_rows = HashMap::new();
+        let mut mask = RowAddrTreeMap::new();
+        let mut masked = false;
+        for plan in &plans {
+            match &plan.scan {
+                FragmentScan::None => continue,
+                FragmentScan::Whole => {
+                    let base_addr = plan.fragment.id << 32;
+                    mask.insert_range(base_addr..base_addr + plan.physical_rows);
+                }
+                FragmentScan::Intervals(intervals) => {
+                    mask |= intervals;
+                    masked = true;
+                }
             }
-            FragmentScan::Whole => None,
-            FragmentScan::Intervals(mask) => Some(mask.clone()),
-        };
+            fragments.push(plan.fragment.clone());
+            physical_rows.insert(plan.fragment.id, plan.physical_rows);
+        }
+        if fragments.is_empty() {
+            return Ok(BatchResult {
+                plans,
+                scanned: None,
+            });
+        }
+        // Only interval fragments need the mask; without one the whole
+        // fragments are read as such, which V1 storage also accepts.
         let scan = load_training_data(
             dataset,
             column,
             criteria,
-            Some(vec![plan.fragment.clone()]),
+            Some(fragments),
             true,
             None,
-            mask,
+            masked.then_some(mask),
         )
         .await?;
         let scanned = train_zonemap_scan(
             data_type,
             rows_per_zone,
             keep_positions,
-            HashMap::from([(plan.fragment.id, plan.physical_rows)]),
+            physical_rows,
             scan,
         )
         .await?;
-        Ok(FragmentResult {
-            plan,
+        Ok(BatchResult {
+            plans,
             scanned: Some(scanned),
         })
     }
@@ -356,12 +382,13 @@ fn scan_fragment<'a>(
 }
 
 /// Assemble one segment over `fragments`, fragment by fragment: each reads
-/// its seed, folds the records that fit the target zones, and scans only
-/// what the seed did not cover, in its own scan that starts as soon as the
-/// seed is decided. Up to [`harvest_concurrency`] seeds are read at once
-/// and up to [`scan_concurrency`] fragments scanned at once; results are
-/// folded in fragment order, so a fragment's raw seed buffer is held only
-/// until it is decided.
+/// its seed, folds the records that fit the target zones, and leaves only
+/// what the seed did not cover to a scan. Decided fragments are scanned in
+/// batches of [`ZONEMAP_SCAN_BATCH_FRAGMENTS`], each batch as soon as it is
+/// decided, so scanning overlaps the seed reads of later fragments. Up to
+/// [`harvest_concurrency`] seeds are read at once and [`scan_concurrency`]
+/// batches scanned at once; results fold in fragment order, and a raw seed
+/// buffer is held only until its fragment is decided.
 #[allow(clippy::too_many_arguments)]
 async fn assemble_segment(
     dataset: &Dataset,
@@ -383,7 +410,7 @@ async fn assemble_segment(
     let scans = scan_concurrency(dataset);
     // Type-erased so the enclosing future's `Send` bound does not depend
     // on the stages' borrowed lifetimes.
-    let mut results: BoxStream<'_, Result<FragmentResult<'_>>> =
+    let mut results: BoxStream<'_, Result<BatchResult<'_>>> =
         futures::stream::iter(fragments.iter())
             .map(|fragment| {
                 plan_fragment(
@@ -398,15 +425,16 @@ async fn assemble_segment(
                 )
             })
             .buffered(concurrency)
-            .map(|plan| {
-                scan_fragment(
+            .try_chunks(ZONEMAP_SCAN_BATCH_FRAGMENTS)
+            .map(|plans| {
+                scan_batch(
                     dataset,
                     column,
                     criteria,
                     data_type,
                     rows_per_zone,
                     keep_positions,
-                    plan,
+                    plans.map_err(|err| err.1),
                 )
             })
             .buffered(scans)
@@ -417,18 +445,22 @@ async fn assemble_segment(
     let mut scanned_fragments: Vec<u64> = Vec::new();
     let mut scanned_rows = 0u64;
     let mut total_seed_bytes = 0usize;
-    while let Some(FragmentResult {
-        plan,
+    let mut scan_count = 0usize;
+    while let Some(BatchResult {
+        plans,
         scanned: pieces,
     }) = results.try_next().await?
     {
-        total_seed_bytes += plan.seed_bytes;
-        scanned_rows += plan.scanned_rows;
-        if !matches!(plan.scan, FragmentScan::None) {
-            scanned_fragments.push(plan.fragment.id);
+        for plan in plans {
+            total_seed_bytes += plan.seed_bytes;
+            scanned_rows += plan.scanned_rows;
+            if !matches!(plan.scan, FragmentScan::None) {
+                scanned_fragments.push(plan.fragment.id);
+            }
+            reused.merge(plan.reused);
         }
-        reused.merge(plan.reused);
         if let Some(pieces) = pieces {
+            scan_count += 1;
             scanned.merge(pieces);
         }
     }
@@ -439,7 +471,7 @@ async fn assemble_segment(
     let max_live_seed_bytes = counters.max_live_seed_bytes.into_inner();
     let max_concurrent_harvests = counters.max_in_flight.into_inner();
     log::info!(
-        "zone map segment for {column}: {} fragments from seeds, {} partly, {} scanned ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
+        "zone map segment for {column}: {} fragments from seeds, {} partly, {} scanned in {scan_count} scans ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
         reused.reused_fragments.len(),
         reused.partial_fragments.len(),
         scanned_fragments.len(),
@@ -454,6 +486,7 @@ async fn assemble_segment(
             zones_from_seeds: reused.num_zones(),
             scanned_fragments: scanned_fragments.clone(),
             scanned_rows,
+            scans: scan_count,
             max_live_seed_bytes,
             max_concurrent_harvests,
             harvest_concurrency: concurrency,
