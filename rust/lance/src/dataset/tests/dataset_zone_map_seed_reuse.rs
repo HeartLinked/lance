@@ -1724,8 +1724,9 @@ impl lance_io::object_store::WrappingObjectStore for SlowReadsWrapper {
 }
 
 /// Seeds are harvested a bounded number of fragments at a time: the footer
-/// reads overlap, never beyond the harvest concurrency, and the raw seed
-/// buffers held at once stay within that window.
+/// reads overlap, never beyond the harvest concurrency, and a raw seed
+/// buffer is released as soon as its fragment is decided, so no more than
+/// one is held at a time.
 #[tokio::test]
 #[allow(clippy::print_stderr)]
 async fn test_harvest_reads_are_bounded_and_concurrent() {
@@ -1808,9 +1809,8 @@ async fn test_harvest_reads_are_bounded_and_concurrent() {
     assert_eq!(report.scanned_rows, 0);
     let per_seed = report.total_seed_bytes / seeded.len();
     assert!(
-        report.max_live_seed_bytes > per_seed
-            && report.max_live_seed_bytes <= concurrency * per_seed,
-        "{} live seed bytes, {per_seed} per seed, window {concurrency}",
+        report.max_live_seed_bytes <= per_seed,
+        "{} live seed bytes, {per_seed} per seed",
         report.max_live_seed_bytes
     );
     assert_index_matches_scan(&dataset, &["val = 23", "val IS NULL", "val > 500000"]).await;

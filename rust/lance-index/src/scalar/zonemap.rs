@@ -2735,6 +2735,17 @@ impl ReusedZones {
         }
     }
 
+    /// Fold another assembly into this one. The two cover disjoint
+    /// fragments, so zone keys never collide.
+    pub fn merge(&mut self, other: Self) {
+        self.zones.extend(other.zones);
+        self.null_rows |= &other.null_rows;
+        self.reused_fragments.extend(other.reused_fragments);
+        self.partial_fragments.extend(other.partial_fragments);
+        self.rejected_fragments.extend(other.rejected_fragments);
+        self.reused_records += other.reused_records;
+    }
+
     pub fn num_zones(&self) -> usize {
         self.zones.len()
     }
@@ -3443,6 +3454,79 @@ impl ZoneMapSegmentBase<'_> {
     }
 }
 
+/// Zone statistics produced by scanning rows, ready to complete the zones
+/// of [`ReusedZones`]: a zone fed partly from seeds receives the scanned
+/// rows' piece, a zone with no seed is the scanned piece.
+#[derive(Debug, Default)]
+pub struct ScannedZones {
+    zones: Vec<ZoneMapStatistics>,
+    null_rows: RowAddrTreeMap,
+}
+
+impl ScannedZones {
+    /// Append another scan's pieces; the two cover disjoint rows.
+    pub fn merge(&mut self, other: Self) {
+        self.zones.extend(other.zones);
+        self.null_rows |= &other.null_rows;
+    }
+}
+
+/// Train zone pieces from `scan`, whose rows carry their addresses and are
+/// cut into target zones of `rows_per_zone` aligned to each fragment's
+/// `physical_rows`. One call may cover a single fragment or many.
+pub async fn train_zonemap_scan(
+    data_type: &DataType,
+    rows_per_zone: u64,
+    keep_positions: bool,
+    physical_rows: HashMap<u64, u64>,
+    scan: SendableRecordBatchStream,
+) -> Result<ScannedZones> {
+    let processor = ZoneMapProcessor::new(data_type.clone())?;
+    let trainer = ZoneTrainer::new(processor, rows_per_zone)?
+        .with_null_tracking(keep_positions)
+        .aligned_to(physical_rows);
+    let (zones, null_rows) = trainer.train(scan).await?;
+    Ok(ScannedZones { zones, null_rows })
+}
+
+/// [`write_zonemap_segment`] after training `scan`, when there is one.
+pub async fn build_zonemap_segment(
+    base: ZoneMapSegmentBase<'_>,
+    data_type: &DataType,
+    reused: ReusedZones,
+    scan: Option<SendableRecordBatchStream>,
+    physical_rows: &HashMap<u64, u64>,
+    refreshed_fragments: &[u64],
+    dest_store: &dyn IndexStore,
+) -> Result<CreatedIndex> {
+    let scanned = match scan {
+        Some(scan) => {
+            let data_type = match &base {
+                ZoneMapSegmentBase::Update(index) => &index.data_type,
+                ZoneMapSegmentBase::New(_) => data_type,
+            };
+            train_zonemap_scan(
+                data_type,
+                base.rows_per_zone(),
+                base.keeps_null_positions(),
+                physical_rows.clone(),
+                scan,
+            )
+            .await?
+        }
+        None => ScannedZones::default(),
+    };
+    write_zonemap_segment(
+        base,
+        data_type,
+        reused,
+        scanned,
+        refreshed_fragments,
+        dest_store,
+    )
+    .await
+}
+
 /// Write one ZoneMap segment from the target zones seeds supplied plus,
 /// optionally, a scan of the rows they did not: whole fragments and the
 /// uncovered intervals of partial ones. The scan is cut at the same physical
@@ -3455,12 +3539,11 @@ impl ZoneMapSegmentBase<'_> {
 /// superseded (a column replacement retires the values they described).
 /// When the base keeps exact null positions, `reused` must have been built
 /// with `need_null_positions` and the scan collects positions too.
-pub async fn build_zonemap_segment(
+pub async fn write_zonemap_segment(
     base: ZoneMapSegmentBase<'_>,
     data_type: &DataType,
     reused: ReusedZones,
-    scan: Option<SendableRecordBatchStream>,
-    physical_rows: &HashMap<u64, u64>,
+    scanned: ScannedZones,
     refreshed_fragments: &[u64],
     dest_store: &dyn IndexStore,
 ) -> Result<CreatedIndex> {
@@ -3511,27 +3594,20 @@ pub async fn build_zonemap_segment(
         rows
     });
     let mut targets = reused.zones;
-    if let Some(scan) = scan {
-        let processor = ZoneMapProcessor::new(data_type.clone())?;
-        let trainer = ZoneTrainer::new(processor, params.rows_per_zone)?
-            .with_null_tracking(keep_positions)
-            .aligned_to(physical_rows.clone());
-        let (scanned, scanned_nulls) = trainer.train(scan).await?;
-        for piece in scanned {
-            let key = (
-                piece.bound.fragment_id,
-                piece.bound.start / params.rows_per_zone,
-            );
-            match targets.get_mut(&key) {
-                Some(zone) => fold_zone_stats(zone, &piece)?,
-                None => {
-                    targets.insert(key, piece);
-                }
+    for piece in scanned.zones {
+        let key = (
+            piece.bound.fragment_id,
+            piece.bound.start / params.rows_per_zone,
+        );
+        match targets.get_mut(&key) {
+            Some(zone) => fold_zone_stats(zone, &piece)?,
+            None => {
+                targets.insert(key, piece);
             }
         }
-        if let Some(rows) = null_rows.as_mut() {
-            *rows |= &scanned_nulls;
-        }
+    }
+    if let Some(rows) = null_rows.as_mut() {
+        *rows |= &scanned.null_rows;
     }
     zones.extend(targets.into_values());
     zones.sort_by_key(|zone| (zone.bound.fragment_id, zone.bound.start));

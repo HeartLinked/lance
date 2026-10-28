@@ -7,16 +7,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow_schema::DataType;
 use futures::future::BoxFuture;
-use futures::stream::FuturesOrdered;
-use futures::{FutureExt, TryStreamExt};
+use futures::stream::BoxStream;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use lance_index::metrics::NoOpMetricsCollector;
 use lance_index::scalar::lance_format::LanceIndexStore;
-use lance_index::scalar::seed::FragmentSeed;
 use lance_index::scalar::zonemap::{
-    HarvestedZoneSeed, NULL_BITMAP_POLICY_META_KEY, ReusedZones, SeedOutcome,
+    HarvestedZoneSeed, NULL_BITMAP_POLICY_META_KEY, ReusedZones, ScannedZones, SeedOutcome,
     ZONEMAP_INDEX_FILENAME, ZoneMapIndex, ZoneMapIndexBuilderParams, ZoneMapSegmentBase,
-    build_zonemap_segment,
+    train_zonemap_scan, write_zonemap_segment,
 };
 use lance_index::scalar::{
     CreatedIndex, IndexStore, ScalarIndex, TrainingCriteria, index_files_to_table,
@@ -168,28 +167,6 @@ pub fn harvest_concurrency(dataset: &Dataset) -> usize {
         .clamp(1, ZONEMAP_HARVEST_CONCURRENCY_CAP)
 }
 
-type HarvestFuture<'a> = BoxFuture<'a, Result<(&'a Fragment, u64, Option<FragmentSeed>)>>;
-
-/// One fragment's physical row count and seed, with the seed's bytes added
-/// to the live count the moment they are held.
-async fn harvest_one<'a>(
-    dataset: &'a Dataset,
-    harvester: Option<&'a SeedHarvester<'a>>,
-    fragment: &'a Fragment,
-    counters: &'a HarvestCounters,
-) -> Result<(&'a Fragment, u64, Option<FragmentSeed>)> {
-    let _in_flight = counters.enter();
-    let rows = physical_rows(dataset, fragment).await?;
-    let seed = match harvester {
-        Some(harvester) => harvester.harvest(fragment).await?,
-        None => None,
-    };
-    if let Some(seed) = &seed {
-        counters.hold(seed.bytes.len());
-    }
-    Ok((fragment, rows, seed))
-}
-
 /// Live counts of a bounded harvest: fragments in flight and raw seed bytes
 /// held (read and not yet folded), each with its peak.
 #[derive(Default)]
@@ -225,18 +202,166 @@ impl Drop for InFlightHarvest<'_> {
     }
 }
 
-/// Harvest, fold and partition the seeds of `fragments`, scan the rows the
-/// seeds did not cover, and write one segment.
-///
-/// Partition per fragment: whole seed records inside a target zone are
-/// folded; a fragment with crossing records contributes its uncovered
-/// intervals to the scan mask, or is scanned whole when partial reuse is
-/// not allowed (a deletion file, so physical and live populations are not
-/// mixed in one zone; or V1 storage, which cannot take a physical mask).
-/// Seeds are read [`harvest_concurrency`] fragments at a time and folded in
-/// fragment order, so at most that many raw seed buffers are held at once
-/// (read or waiting to be folded) and a fragment's buffer is dropped once
-/// it is folded; placement is the same as a one-at-a-time read.
+/// Most fragments scanned at once by [`assemble_segment`]. Each scan reads
+/// at the store's parallelism, so a few in flight saturate it.
+const ZONEMAP_SCAN_CONCURRENCY_CAP: usize = 4;
+
+fn scan_concurrency(dataset: &Dataset) -> usize {
+    (dataset.object_store.io_parallelism() / 16).clamp(1, ZONEMAP_SCAN_CONCURRENCY_CAP)
+}
+
+/// How a fragment's rows are read once its seed is decided.
+enum FragmentScan {
+    /// Every target zone came from the seed.
+    None,
+    /// The fragment is read whole.
+    Whole,
+    /// Only these physical rows are read: the seed records that cross a
+    /// target boundary.
+    Intervals(RowAddrTreeMap),
+}
+
+/// One fragment's seed decision, made before any of its rows are read.
+struct FragmentPlan<'a> {
+    fragment: &'a Fragment,
+    physical_rows: u64,
+    /// Zones this fragment's seed supplied, if any.
+    reused: ReusedZones,
+    scan: FragmentScan,
+    scanned_rows: u64,
+    seed_bytes: usize,
+}
+
+/// A fragment's plan with the zone pieces its scan produced.
+struct FragmentResult<'a> {
+    plan: FragmentPlan<'a>,
+    scanned: Option<ScannedZones>,
+}
+
+/// Decide one fragment: read its seed, fold the records that fit the
+/// target zones, and leave the rest to a scan of this fragment alone. The
+/// raw seed buffer is released before the plan is returned.
+#[allow(clippy::too_many_arguments)]
+fn plan_fragment<'a>(
+    dataset: &'a Dataset,
+    harvester: Option<&'a SeedHarvester<'a>>,
+    fragment: &'a Fragment,
+    counters: &'a HarvestCounters,
+    rows_per_zone: u64,
+    data_type: &'a DataType,
+    keep_positions: bool,
+    legacy_storage: bool,
+) -> BoxFuture<'a, Result<FragmentPlan<'a>>> {
+    async move {
+        let _in_flight = counters.enter();
+        let physical_rows = physical_rows(dataset, fragment).await?;
+        let mut reused = ReusedZones::new(keep_positions);
+        let mut seed_bytes = 0;
+        let seed = match harvester {
+            Some(harvester) => harvester.harvest(fragment).await?,
+            None => None,
+        };
+        let outcome = match seed {
+            Some(seed) => {
+                seed_bytes = seed.bytes.len();
+                counters.hold(seed_bytes);
+                // A deletion file would mix physical and live populations in one
+                // zone, and V1 storage cannot take a physical mask: those
+                // fragments are reused whole or scanned whole.
+                let allow_partial = !legacy_storage && fragment.deletion_file.is_none();
+                let harvested = HarvestedZoneSeed {
+                    seed,
+                    physical_rows,
+                };
+                let outcome = reused.reuse(&harvested, rows_per_zone, data_type, allow_partial);
+                drop(harvested);
+                counters.release(seed_bytes);
+                outcome?
+            }
+            None => SeedOutcome::Rejected,
+        };
+        let base_addr = fragment.id << 32;
+        let (scan, scanned_rows) = match outcome {
+            SeedOutcome::Complete => (FragmentScan::None, 0),
+            SeedOutcome::Partial(intervals) => {
+                let mut mask = RowAddrTreeMap::new();
+                let mut rows = 0;
+                for interval in intervals {
+                    rows += interval.end - interval.start;
+                    mask.insert_range(base_addr + interval.start..base_addr + interval.end);
+                }
+                (FragmentScan::Intervals(mask), rows)
+            }
+            SeedOutcome::Rejected => (FragmentScan::Whole, physical_rows),
+        };
+        Ok(FragmentPlan {
+            fragment,
+            physical_rows,
+            reused,
+            scan,
+            scanned_rows,
+            seed_bytes,
+        })
+    }
+    .boxed()
+}
+
+/// Read the rows `plan` left to the scan and cut them into this fragment's
+/// target zones.
+fn scan_fragment<'a>(
+    dataset: &'a Dataset,
+    column: &'a str,
+    criteria: &'a TrainingCriteria,
+    data_type: &'a DataType,
+    rows_per_zone: u64,
+    keep_positions: bool,
+    plan: Result<FragmentPlan<'a>>,
+) -> BoxFuture<'a, Result<FragmentResult<'a>>> {
+    async move {
+        let plan = plan?;
+        let mask = match &plan.scan {
+            FragmentScan::None => {
+                return Ok(FragmentResult {
+                    plan,
+                    scanned: None,
+                });
+            }
+            FragmentScan::Whole => None,
+            FragmentScan::Intervals(mask) => Some(mask.clone()),
+        };
+        let scan = load_training_data(
+            dataset,
+            column,
+            criteria,
+            Some(vec![plan.fragment.clone()]),
+            true,
+            None,
+            mask,
+        )
+        .await?;
+        let scanned = train_zonemap_scan(
+            data_type,
+            rows_per_zone,
+            keep_positions,
+            HashMap::from([(plan.fragment.id, plan.physical_rows)]),
+            scan,
+        )
+        .await?;
+        Ok(FragmentResult {
+            plan,
+            scanned: Some(scanned),
+        })
+    }
+    .boxed()
+}
+
+/// Assemble one segment over `fragments`, fragment by fragment: each reads
+/// its seed, folds the records that fit the target zones, and scans only
+/// what the seed did not cover, in its own scan that starts as soon as the
+/// seed is decided. Up to [`harvest_concurrency`] seeds are read at once
+/// and up to [`scan_concurrency`] fragments scanned at once; results are
+/// folded in fragment order, so a fragment's raw seed buffer is held only
+/// until it is decided.
 #[allow(clippy::too_many_arguments)]
 async fn assemble_segment(
     dataset: &Dataset,
@@ -249,80 +374,75 @@ async fn assemble_segment(
     store: &dyn IndexStore,
 ) -> Result<CreatedIndex> {
     let rows_per_zone = base.rows_per_zone();
+    let keep_positions = base.keeps_null_positions();
     let legacy_storage = dataset.manifest.data_storage_format.lance_file_format()
         == lance_file::version::ConcreteFileVersion::V1;
-    let mut reused = ReusedZones::new(base.keeps_null_positions());
-    let mut rows_by_fragment: HashMap<u64, u64> = HashMap::new();
-    let mut to_scan: Vec<Fragment> = Vec::new();
-    let mut mask = RowAddrTreeMap::new();
-    let mut scanned_rows = 0u64;
     let counters = HarvestCounters::default();
-    let mut total_seed_bytes = 0usize;
     let harvester = harvester.as_ref();
     let concurrency = harvest_concurrency(dataset);
-    // A window of at most `concurrency` harvests, consumed in fragment order.
-    let mut pending: FuturesOrdered<HarvestFuture<'_>> = FuturesOrdered::new();
-    let mut remaining = fragments.iter();
-    loop {
-        while pending.len() < concurrency {
-            let Some(fragment) = remaining.next() else {
-                break;
-            };
-            pending.push_back(harvest_one(dataset, harvester, fragment, &counters).boxed());
+    let scans = scan_concurrency(dataset);
+    // Type-erased so the enclosing future's `Send` bound does not depend
+    // on the stages' borrowed lifetimes.
+    let mut results: BoxStream<'_, Result<FragmentResult<'_>>> =
+        futures::stream::iter(fragments.iter())
+            .map(|fragment| {
+                plan_fragment(
+                    dataset,
+                    harvester,
+                    fragment,
+                    &counters,
+                    rows_per_zone,
+                    data_type,
+                    keep_positions,
+                    legacy_storage,
+                )
+            })
+            .buffered(concurrency)
+            .map(|plan| {
+                scan_fragment(
+                    dataset,
+                    column,
+                    criteria,
+                    data_type,
+                    rows_per_zone,
+                    keep_positions,
+                    plan,
+                )
+            })
+            .buffered(scans)
+            .boxed();
+
+    let mut reused = ReusedZones::new(keep_positions);
+    let mut scanned = ScannedZones::default();
+    let mut scanned_fragments: Vec<u64> = Vec::new();
+    let mut scanned_rows = 0u64;
+    let mut total_seed_bytes = 0usize;
+    while let Some(FragmentResult {
+        plan,
+        scanned: pieces,
+    }) = results.try_next().await?
+    {
+        total_seed_bytes += plan.seed_bytes;
+        scanned_rows += plan.scanned_rows;
+        if !matches!(plan.scan, FragmentScan::None) {
+            scanned_fragments.push(plan.fragment.id);
         }
-        let Some((fragment, rows, seed)) = pending.try_next().await? else {
-            break;
-        };
-        rows_by_fragment.insert(fragment.id, rows);
-        let allow_partial = !legacy_storage && fragment.deletion_file.is_none();
-        let outcome = match seed {
-            Some(seed) => {
-                let harvested = HarvestedZoneSeed {
-                    seed,
-                    physical_rows: rows,
-                };
-                let bytes = harvested.seed.bytes.len();
-                total_seed_bytes += bytes;
-                let outcome = reused.reuse(&harvested, rows_per_zone, data_type, allow_partial)?;
-                // The raw buffer does not outlive its fragment's fold. The
-                // explicit drop keeps the live count honest: moving
-                // `harvested` anywhere else would not compile past it.
-                drop(harvested);
-                counters.release(bytes);
-                outcome
-            }
-            None => SeedOutcome::Rejected,
-        };
-        let base_addr = fragment.id << 32;
-        match outcome {
-            SeedOutcome::Complete => {}
-            SeedOutcome::Partial(intervals) => {
-                to_scan.push(fragment.clone());
-                for interval in intervals {
-                    scanned_rows += interval.end - interval.start;
-                    mask.insert_range(base_addr + interval.start..base_addr + interval.end);
-                }
-            }
-            SeedOutcome::Rejected => {
-                to_scan.push(fragment.clone());
-                scanned_rows += rows;
-                mask.insert_range(base_addr..base_addr + rows);
-            }
+        reused.merge(plan.reused);
+        if let Some(pieces) = pieces {
+            scanned.merge(pieces);
         }
     }
-    // A legacy-storage scanner refuses any physical mask; there every
-    // fragment to scan is scanned whole (partial reuse was not allowed), so
-    // selecting the fragments is the whole selection.
-    // The window is drained; release its borrow of the counters.
-    drop(pending);
-    let masked = !legacy_storage && !to_scan.is_empty();
+    // The pipeline is drained; release its borrow of the counters.
+    drop(results);
+    #[cfg(test)]
+    let masked = !legacy_storage && !scanned_fragments.is_empty();
     let max_live_seed_bytes = counters.max_live_seed_bytes.into_inner();
     let max_concurrent_harvests = counters.max_in_flight.into_inner();
     log::info!(
         "zone map segment for {column}: {} fragments from seeds, {} partly, {} scanned ({scanned_rows} rows, {} seed records, {total_seed_bytes} seed bytes, at most {max_live_seed_bytes} held at once over {max_concurrent_harvests} concurrent harvests)",
         reused.reused_fragments.len(),
         reused.partial_fragments.len(),
-        to_scan.len(),
+        scanned_fragments.len(),
         reused.reused_records
     );
     #[cfg(test)]
@@ -332,7 +452,7 @@ async fn assemble_segment(
             partial_fragments: reused.partial_fragments.clone(),
             reused_records: reused.reused_records,
             zones_from_seeds: reused.num_zones(),
-            scanned_fragments: to_scan.iter().map(|fragment| fragment.id).collect(),
+            scanned_fragments: scanned_fragments.clone(),
             scanned_rows,
             max_live_seed_bytes,
             max_concurrent_harvests,
@@ -341,33 +461,8 @@ async fn assemble_segment(
             masked,
         })
     });
-    let scan = if to_scan.is_empty() {
-        None
-    } else {
-        Some(
-            load_training_data(
-                dataset,
-                column,
-                criteria,
-                Some(to_scan),
-                true,
-                None,
-                masked.then_some(mask),
-            )
-            .await?,
-        )
-    };
     let refreshed: Vec<u64> = fragments.iter().map(|fragment| fragment.id).collect();
-    build_zonemap_segment(
-        base,
-        data_type,
-        reused,
-        scan,
-        &rows_by_fragment,
-        &refreshed,
-        store,
-    )
-    .await
+    write_zonemap_segment(base, data_type, reused, scanned, &refreshed, store).await
 }
 
 /// The fragments with these ids, in id order, erroring on an unknown id.
@@ -399,13 +494,18 @@ pub(in crate::index) async fn build_segment_with_seeds(
         Some(ids) => fragments_by_id(dataset, ids)?,
         None => dataset.fragments().as_ref().clone(),
     };
+    // An index that does not request seeds reads none, as on update.
+    let harvester = params
+        .use_seeds_for(data_type)
+        .then(|| SeedHarvester::for_column(dataset, column))
+        .flatten();
     assemble_segment(
         dataset,
         column,
         ZoneMapSegmentBase::New(params),
         data_type,
         &fragments,
-        SeedHarvester::for_column(dataset, column),
+        harvester,
         criteria,
         store,
     )
