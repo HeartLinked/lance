@@ -741,6 +741,103 @@ async fn test_mixed_assembly_masks_partial_intervals_and_whole_fragments() {
     assert_index_matches_scan(&dataset, VAL_FILTERS).await;
 }
 
+/// The harvester resolves the field path it is given: a top-level name
+/// that needs quoting finds its column, quoted or not, and a nested path
+/// has no seed of its own.
+#[tokio::test]
+async fn test_harvester_resolves_field_paths() {
+    use crate::index::append::SeedHarvester;
+    use arrow_array::{ArrayRef, StructArray};
+    let child = Arc::new(ArrowField::new("b", DataType::Int64, false));
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("user-id", DataType::Int64, false),
+        ArrowField::new(
+            "a",
+            DataType::Struct(vec![child.as_ref().clone()].into()),
+            false,
+        ),
+    ]));
+    let batch = |start: i64| {
+        let values = || Arc::new(Int64Array::from_iter_values(start..start + 1000)) as ArrayRef;
+        RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                values(),
+                Arc::new(StructArray::from(vec![(child.clone(), values())])),
+            ],
+        )
+        .unwrap()
+    };
+    let dir = TempStrDir::default();
+    let mut dataset = Dataset::write(
+        RecordBatchIterator::new([Ok(batch(0))], schema.clone()),
+        dir.as_str(),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset
+        .create_index(
+            &["user-id"],
+            IndexType::ZoneMap,
+            None,
+            &zone_map_params(100, true, false),
+            false,
+        )
+        .await
+        .unwrap();
+    dataset
+        .append(
+            RecordBatchIterator::new([Ok(batch(1000))], schema.clone()),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(SeedHarvester::for_column(&dataset, "`user-id`").is_some());
+    assert!(SeedHarvester::for_column(&dataset, "user-id").is_some());
+    assert!(SeedHarvester::for_column(&dataset, "a.b").is_none());
+    assert!(SeedHarvester::for_column(&dataset, "missing").is_none());
+
+    // The create path formats the column as a quoted path and still reuses
+    // the appended fragment's seed.
+    let (_, reports) = with_reports(async {
+        dataset
+            .create_index(
+                &["user-id"],
+                IndexType::ZoneMap,
+                None,
+                &zone_map_params(100, true, false),
+                true,
+            )
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!(reports[0].reused_fragments, vec![1]);
+    assert_eq!(reports[0].scanned_fragments, vec![0]);
+}
+
+/// A zero zone size is refused before any segment is written, also for a
+/// build that scans nothing.
+#[tokio::test]
+async fn test_zero_rows_per_zone_is_rejected_without_a_scan() {
+    let dir = TempStrDir::default();
+    let mut dataset = write(dir.as_str(), 0..N).await;
+    let err = CreateIndexBuilder::new(
+        &mut dataset,
+        &["val"],
+        IndexType::ZoneMap,
+        &zone_map_params(0, true, false),
+    )
+    .name(index_name("val"))
+    .fragments(vec![])
+    .await
+    .unwrap_err();
+    assert!(err.to_string().contains("rows_per_zone"), "{err}");
+    assert!(index_metadata(&dataset, "val").await.is_empty());
+}
+
 /// Legacy (V1) storage cannot take a physical mask: seeded fragments are
 /// scanned whole without a mask and statistics equal the scan.
 #[tokio::test]

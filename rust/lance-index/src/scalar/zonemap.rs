@@ -1572,6 +1572,14 @@ pub struct ZoneMapIndexBuilder {
 
 impl ZoneMapIndexBuilder {
     pub fn try_new(options: ZoneMapIndexBuilderParams, items_type: DataType) -> Result<Self> {
+        // Checked here, before any segment is written: a build that scans
+        // nothing (no fragments, or every zone from seeds) never reaches the
+        // trainer's own check.
+        if options.rows_per_zone == 0 {
+            return Err(Error::invalid_input(
+                "rows_per_zone must be greater than zero",
+            ));
+        }
         Ok(Self {
             options,
             version: ZoneMapIndexVersion::CURRENT,

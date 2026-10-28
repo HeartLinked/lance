@@ -518,14 +518,16 @@ impl<'a> SeedHarvester<'a> {
         })
     }
 
-    /// A harvester for the top-level column named `column`.
+    /// A harvester for the top-level column at field path `column`, which
+    /// may be quoted. A nested path has no seed of its own and yields `None`;
+    /// resolving the path keeps it apart from a top-level name that reads
+    /// the same.
     pub fn for_column(dataset: &'a Dataset, column: &str) -> Option<Self> {
-        let field = dataset.schema().fields.iter().find(|f| f.name == column)?;
-        Some(Self {
-            dataset,
-            field,
-            schedulers: std::sync::Mutex::new(HashMap::new()),
-        })
+        let path = dataset.schema().resolve(column)?;
+        let [field] = path.as_slice() else {
+            return None;
+        };
+        Self::for_field_id(dataset, field.id)
     }
 
     /// The scan scheduler for `base_id`, created on first use. A concurrent
