@@ -26,7 +26,7 @@ use roaring::RoaringBitmap;
 use uuid::Uuid;
 
 use crate::index::append::SeedHarvester;
-use crate::index::scalar::load_training_data;
+use crate::index::scalar::{TrainingRows, scan_training_data};
 use crate::{Dataset, Error, Result, dataset::index::LanceIndexStoreExt};
 
 /// Merge one caller-defined group of source ZoneMap segments into a single segment.
@@ -332,6 +332,7 @@ fn scan_batch<'a>(
         let mut physical_rows = HashMap::new();
         let mut mask = RowAddrTreeMap::new();
         let mut masked = false;
+        let mut batch_rows = 0u64;
         for plan in &plans {
             match &plan.scan {
                 FragmentScan::None => continue,
@@ -346,6 +347,7 @@ fn scan_batch<'a>(
             }
             fragments.push(plan.fragment.clone());
             physical_rows.insert(plan.fragment.id, plan.physical_rows);
+            batch_rows += plan.scanned_rows;
         }
         if fragments.is_empty() {
             return Ok(BatchResult {
@@ -354,15 +356,16 @@ fn scan_batch<'a>(
             });
         }
         // Only interval fragments need the mask; without one the whole
-        // fragments are read as such, which V1 storage also accepts.
-        let scan = load_training_data(
+        // fragments are read as such, which V1 storage also accepts. The
+        // batch's own row count is the progress total: nothing counts the
+        // dataset per batch.
+        let scan = scan_training_data(
             dataset,
             column,
             criteria,
-            Some(fragments),
-            true,
-            None,
+            Some(TrainingRows::Fragments(fragments)),
             masked.then_some(mask),
+            Some(batch_rows),
         )
         .await?;
         let scanned = train_zonemap_scan(

@@ -712,6 +712,7 @@ async fn load_unindexed_training_data(
         &update_criteria.data_criteria,
         selection,
         None,
+        None,
     )
     .await
 }

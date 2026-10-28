@@ -158,14 +158,20 @@ pub(crate) enum TrainingRows {
 /// by value when the index type needs it. The scan goes through the regular
 /// reader, so deletions and data overlays are already applied to what it
 /// yields. `selection` restricts the rows read; `None` reads the whole dataset.
+/// `expected_rows`, when the caller knows how many rows the selection
+/// holds, is the progress total; otherwise the whole dataset is counted.
 pub(crate) async fn scan_training_data(
     dataset: &Dataset,
     column: &str,
     criteria: &TrainingCriteria,
     selection: Option<TrainingRows>,
     physical_rows: Option<RowAddrTreeMap>,
+    expected_rows: Option<u64>,
 ) -> Result<SendableRecordBatchStream> {
-    let num_rows = dataset.count_all_rows().await?;
+    let num_rows = match expected_rows {
+        Some(rows) => rows as usize,
+        None => dataset.count_all_rows().await?,
+    };
 
     let mut scan = dataset.scan();
     #[cfg(test)]
@@ -281,10 +287,10 @@ pub(crate) async fn load_training_data(
                 })
                 .collect();
             let selection = Some(TrainingRows::Fragments(frags?));
-            scan_training_data(dataset, column, criteria, selection, physical_rows).await
+            scan_training_data(dataset, column, criteria, selection, physical_rows, None).await
         } else {
             let selection = fragments.map(TrainingRows::Fragments);
-            scan_training_data(dataset, column, criteria, selection, physical_rows).await
+            scan_training_data(dataset, column, criteria, selection, physical_rows, None).await
         }
     } else {
         TrainingRequest::create_empty_stream(dataset, column, criteria).await
